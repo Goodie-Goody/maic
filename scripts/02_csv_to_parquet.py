@@ -1,27 +1,22 @@
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import io
 import gc
-import re
 import logging
 import tempfile
 import zipfile
-from datetime import datetime, timezone
-from calendar import monthrange
 
 import pyarrow as pa
 import pyarrow.csv as pcsv
 import pyarrow.parquet as pq
+import pyarrow.compute as pc
 from google.cloud import storage
+from datetime import datetime, timezone
+from calendar import monthrange
 
+# Ensure config is accessible
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
-    ASSETS,
-    BUCKET,
-    WINDOWS,
-    PARQUET_COMPRESSION,
-    SCHEMA,
+    ASSETS, BUCKET, WINDOWS, PARQUET_COMPRESSION, SCHEMA,
 )
 
 logging.basicConfig(
@@ -34,10 +29,9 @@ logger = logging.getLogger(__name__)
 MONTHLY_ZIP_PREFIX = "raw/zips/monthly/"
 DAILY_ZIP_PREFIX = "raw/zips/daily/"
 OUTPUT_PREFIX = "v2/trades_parquet_flat/"
-
 MIN_OUTPUT_BYTES = 10 * 1024 * 1024
-BATCH_SIZE = 500_000
 
+# 1. Final Parquet Schema (Time is UTC Timestamp)
 PYARROW_SCHEMA = pa.schema([
     ("id", pa.int64()),
     ("price", pa.float64()),
@@ -48,6 +42,16 @@ PYARROW_SCHEMA = pa.schema([
     ("is_best_match", pa.bool_()),
 ])
 
+# 2. Raw CSV Schema (Time is raw int64 milliseconds, no headers in file)
+CSV_SCHEMA = pa.schema([
+    ("id", pa.int64()),
+    ("price", pa.float64()),
+    ("qty", pa.float64()),
+    ("quote_qty", pa.float64()),
+    ("time", pa.int64()), 
+    ("is_buyer_maker", pa.bool_()),
+    ("is_best_match", pa.bool_()),
+])
 
 def parse_window_months(start_ym, end_ym):
     months = []
@@ -62,284 +66,235 @@ def parse_window_months(start_ym, end_ym):
             y += 1
     return months
 
-
 def gcs_blob_exists(bucket, blob_path):
-    blob = bucket.blob(blob_path)
-    return blob.exists()
-
+    return bucket.blob(blob_path).exists()
 
 def gcs_blob_size(bucket, blob_path):
     blob = bucket.blob(blob_path)
     blob.reload()
     return blob.size
 
-
-def detect_time_unit(raw_value):
-    try:
-        ts = int(raw_value)
-        if ts < 1e12:
-            return "s"
-        elif ts < 1e15:
-            return "ms"
-        elif ts < 1e18:
-            return "us"
-        else:
-            return "ns"
-    except (ValueError, TypeError):
-        return "ms"
-
-
-def convert_timestamp(raw_value, unit):
-    ts = int(raw_value)
-    if unit == "s":
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
-    elif unit == "ms":
-        return datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
-    elif unit == "us":
-        return datetime.fromtimestamp(ts / 1_000_000, tz=timezone.utc)
-    else:
-        return datetime.fromtimestamp(ts / 1_000_000_000, tz=timezone.utc)
-
-
-def read_zip_from_gcs(bucket, blob_path):
+def download_zip_to_disk(bucket, blob_path):
+    """Downloads to a temp file on disk to save RAM."""
     blob = bucket.blob(blob_path)
     blob.reload()
     size_mb = blob.size / 1024 / 1024
-    logger.info(f"  Downloading {blob_path} ({size_mb:.1f} MB)")
-    buf = io.BytesIO()
-    blob.download_to_file(buf)
-    buf.seek(0)
-    return buf
+    logger.info(f"  Downloading {blob_path} ({size_mb:.1f} MB) to disk")
+    
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    blob.download_to_filename(tmp.name)
+    return tmp.name
 
-
-def process_csv_from_zip(zip_buf, writer, seen_ids, tag):
+def process_csv_from_zip(zip_path, writer, tag):
+    """Processes CSVs using PyArrow's C++ streaming engine for the Fast Route."""
     rows_written = 0
-    rows_skipped = 0
-    time_unit = None
-
-    with zipfile.ZipFile(zip_buf) as zf:
+    
+    with zipfile.ZipFile(zip_path) as zf:
         csv_files = [n for n in zf.namelist() if n.endswith(".csv")]
         if not csv_files:
             logger.warning(f"  {tag} no CSV files found in zip")
-            return rows_written, rows_skipped
+            return 0
 
         for csv_name in csv_files:
-            logger.info(f"  Processing {csv_name}")
+            logger.info(f"  Processing {csv_name} via PyArrow Streaming")
             with zf.open(csv_name) as csv_file:
-                batch_ids = []
-                batch_prices = []
-                batch_qtys = []
-                batch_quote_qtys = []
-                batch_times = []
-                batch_buyer_maker = []
-                batch_best_match = []
+                reader = pcsv.open_csv(
+                    csv_file,
+                    read_options=pcsv.ReadOptions(
+                        block_size=50*1024*1024,
+                        column_names=CSV_SCHEMA.names # Tells PyArrow there are no headers
+                    ),
+                    convert_options=pcsv.ConvertOptions(
+                        column_types=CSV_SCHEMA
+                    )
+                )
 
-                header = csv_file.readline()
-
-                for line in csv_file:
-                    parts = line.decode().strip().split(",")
-                    if len(parts) < 7:
-                        continue
-
-                    try:
-                        trade_id = int(parts[0])
-
-                        if trade_id in seen_ids:
-                            rows_skipped += 1
-                            continue
-
-                        if time_unit is None:
-                            time_unit = detect_time_unit(parts[4])
-                            logger.info(f"  Detected time unit: {time_unit}")
-
-                        ts = convert_timestamp(parts[4], time_unit)
-
-                        batch_ids.append(trade_id)
-                        batch_prices.append(float(parts[1]))
-                        batch_qtys.append(float(parts[2]))
-                        batch_quote_qtys.append(float(parts[3]))
-                        batch_times.append(ts)
-                        batch_buyer_maker.append(parts[5].strip().lower() == "true")
-                        batch_best_match.append(parts[6].strip().lower() == "true")
-
-                        if len(batch_ids) >= BATCH_SIZE:
-                            table = pa.table({
-                                "id": pa.array(batch_ids, type=pa.int64()),
-                                "price": pa.array(batch_prices, type=pa.float64()),
-                                "qty": pa.array(batch_qtys, type=pa.float64()),
-                                "quote_qty": pa.array(batch_quote_qtys, type=pa.float64()),
-                                "time": pa.array(batch_times, type=pa.timestamp("us", tz="UTC")),
-                                "is_buyer_maker": pa.array(batch_buyer_maker, type=pa.bool_()),
-                                "is_best_match": pa.array(batch_best_match, type=pa.bool_()),
-                            })
-                            seen_ids.update(batch_ids)
-                            writer.write_table(table)
-                            rows_written += len(batch_ids)
-
-                            batch_ids.clear()
-                            batch_prices.clear()
-                            batch_qtys.clear()
-                            batch_quote_qtys.clear()
-                            batch_times.clear()
-                            batch_buyer_maker.clear()
-                            batch_best_match.clear()
-
-                            gc.collect()
-
-                    except (ValueError, IndexError):
-                        continue
-
-                # flush remaining rows
-                if batch_ids:
-                    table = pa.table({
-                        "id": pa.array(batch_ids, type=pa.int64()),
-                        "price": pa.array(batch_prices, type=pa.float64()),
-                        "qty": pa.array(batch_qtys, type=pa.float64()),
-                        "quote_qty": pa.array(batch_quote_qtys, type=pa.float64()),
-                        "time": pa.array(batch_times, type=pa.timestamp("us", tz="UTC")),
-                        "is_buyer_maker": pa.array(batch_buyer_maker, type=pa.bool_()),
-                        "is_best_match": pa.array(batch_best_match, type=pa.bool_()),
-                    })
-                    seen_ids.update(batch_ids)
+                for batch in reader:
+                    table = pa.Table.from_batches([batch])
+                    
+                    # Convert int64 milliseconds to Parquet timestamp[us, tz=UTC]
+                    time_us = pc.multiply(table["time"], 1000)
+                    time_col = pc.cast(time_us, pa.timestamp("us", tz="UTC"))
+                    table = table.set_column(4, "time", time_col)
+                    
                     writer.write_table(table)
-                    rows_written += len(batch_ids)
-                    gc.collect()
+                    rows_written += table.num_rows
+                
+                gc.collect()
 
-    return rows_written, rows_skipped
+    return rows_written
 
+def process_csv_with_timestamp_tracking(zip_path, writer, tag, filter_after=None):
+    """Processes CSVs and tracks the max timestamp. Used for the Stitching Route."""
+    rows_written = 0
+    max_ts = filter_after
+
+    with zipfile.ZipFile(zip_path) as zf:
+        csv_files = [n for n in zf.namelist() if n.endswith(".csv")]
+        for csv_name in csv_files:
+            with zf.open(csv_name) as f:
+                reader = pcsv.open_csv(
+                    f, 
+                    read_options=pcsv.ReadOptions(
+                        block_size=50*1024*1024,
+                        column_names=CSV_SCHEMA.names # Tells PyArrow there are no headers
+                    ),
+                    convert_options=pcsv.ConvertOptions(
+                        column_types=CSV_SCHEMA
+                    )
+                )
+                for batch in reader:
+                    table = pa.Table.from_batches([batch])
+                    
+                    # Convert int64 milliseconds to Parquet timestamp[us, tz=UTC]
+                    time_us = pc.multiply(table["time"], 1000)
+                    time_col = pc.cast(time_us, pa.timestamp("us", tz="UTC"))
+                    table = table.set_column(4, "time", time_col)
+                    
+                    if filter_after:
+                        mask = pc.greater(table["time"], filter_after)
+                        table = table.filter(mask)
+                    
+                    if table.num_rows > 0:
+                        writer.write_table(table)
+                        rows_written += table.num_rows
+                        
+                        current_max = pc.max(table["time"]).as_py()
+                        if max_ts is None or (current_max and current_max > max_ts):
+                            max_ts = current_max
+                            
+                gc.collect()
+                
+    return rows_written, max_ts
 
 def process_month(gcs_client, bucket, asset, year, month):
     tag = f"{asset} {year}-{month:02d}"
     output_blob = f"{OUTPUT_PREFIX}{asset}-trades-{year}-{month:02d}.parquet"
 
+    # 1. Check if already complete
     if gcs_blob_exists(bucket, output_blob):
-        size = gcs_blob_size(bucket, output_blob)
-        if size >= MIN_OUTPUT_BYTES:
+        if gcs_blob_size(bucket, output_blob) >= MIN_OUTPUT_BYTES:
             logger.info(f"{tag} already converted, skipping")
             return True
         else:
-            logger.warning(f"{tag} output exists but incomplete, reconverting")
+            logger.warning(f"{tag} incomplete, deleting old version")
             bucket.blob(output_blob).delete()
 
-    # collect all source zips for this month
+    # 2. Gather source files
     monthly_blob = f"{MONTHLY_ZIP_PREFIX}{asset}-trades-{year}-{month:02d}.zip"
+    has_monthly = gcs_blob_exists(bucket, monthly_blob)
+    
     daily_blobs = []
-
     days_in_month = monthrange(year, month)[1]
     for day in range(1, days_in_month + 1):
-        daily_blob = f"{DAILY_ZIP_PREFIX}{asset}-trades-{year}-{month:02d}-{day:02d}.zip"
-        if gcs_blob_exists(bucket, daily_blob):
-            daily_blobs.append((day, daily_blob))
-
-    has_monthly = gcs_blob_exists(bucket, monthly_blob)
+        db = f"{DAILY_ZIP_PREFIX}{asset}-trades-{year}-{month:02d}-{day:02d}.zip"
+        if gcs_blob_exists(bucket, db):
+            daily_blobs.append((day, db))
 
     if not has_monthly and not daily_blobs:
-        logger.warning(f"{tag} no source files found, skipping")
+        logger.warning(f"{tag} no source files found")
         return False
 
-    logger.info(f"{tag} starting conversion")
-    if has_monthly:
-        logger.info(f"  Monthly zip: present")
-    logger.info(f"  Daily zips : {len(daily_blobs)} files")
-
-    # write to local temp file to avoid RAM accumulation
-    temp_path = f"/tmp/{asset}-{year}-{month:02d}.parquet"
-    seen_ids = set()
+    temp_parquet = f"/tmp/{asset}-{year}-{month:02d}.parquet"
     total_written = 0
-    total_skipped = 0
+
+    # ==========================================
+    # THE HARDCODED EXCEPTION TRIGGER
+    # ==========================================
+    is_anomaly_month = (asset == "BTCUSDT" and year == 2023 and month == 3)
 
     try:
-        with pq.ParquetWriter(temp_path, PYARROW_SCHEMA, compression=PARQUET_COMPRESSION) as writer:
+        with pq.ParquetWriter(temp_parquet, PYARROW_SCHEMA, compression=PARQUET_COMPRESSION) as writer:
+            
+            if is_anomaly_month:
+                logger.info(f"{tag} triggers HARDCODED STITCH exception. Merging monthly and dailies.")
+                last_timestamp = None
+                
+                # Process the partial monthly
+                if has_monthly:
+                    zip_path = download_zip_to_disk(bucket, monthly_blob)
+                    try:
+                        written, last_ts = process_csv_with_timestamp_tracking(zip_path, writer, tag)
+                        total_written += written
+                        last_timestamp = last_ts
+                        logger.info(f"  Monthly finished at {last_timestamp}")
+                    finally:
+                        if os.path.exists(zip_path): os.remove(zip_path)
+                
+                # Process Dailies, filtering out overlap
+                for day, db in sorted(daily_blobs):
+                    zip_path = download_zip_to_disk(bucket, db)
+                    try:
+                        written, last_ts = process_csv_with_timestamp_tracking(zip_path, writer, tag, filter_after=last_timestamp)
+                        total_written += written
+                        if last_ts: last_timestamp = last_ts
+                    finally:
+                        if os.path.exists(zip_path): os.remove(zip_path)
 
-            # process monthly zip first
-            if has_monthly:
-                zip_buf = read_zip_from_gcs(bucket, monthly_blob)
-                written, skipped = process_csv_from_zip(zip_buf, writer, seen_ids, tag)
-                total_written += written
-                total_skipped += skipped
-                del zip_buf
-                gc.collect()
-                logger.info(f"  Monthly: {written:,} rows written, {skipped:,} skipped")
+            else:
+                # ==========================================
+                # THE STANDARD FAST ROUTE (99% of months)
+                # ==========================================
+                logger.info(f"{tag} starting standard conversion")
+                
+                if has_monthly:
+                    zip_path = download_zip_to_disk(bucket, monthly_blob)
+                    try:
+                        total_written += process_csv_from_zip(zip_path, writer, tag)
+                    finally:
+                        if os.path.exists(zip_path): os.remove(zip_path)
+                else:
+                    for day, db in sorted(daily_blobs):
+                        zip_path = download_zip_to_disk(bucket, db)
+                        try:
+                            total_written += process_csv_from_zip(zip_path, writer, tag)
+                        finally:
+                            if os.path.exists(zip_path): os.remove(zip_path)
 
-            # process daily zips in order
-            for day, daily_blob in sorted(daily_blobs):
-                zip_buf = read_zip_from_gcs(bucket, daily_blob)
-                written, skipped = process_csv_from_zip(zip_buf, writer, seen_ids, tag)
-                total_written += written
-                total_skipped += skipped
-                del zip_buf
-                gc.collect()
-                logger.info(f"  Day {day:02d}: {written:,} rows written, {skipped:,} skipped")
-
-        logger.info(f"{tag} conversion complete")
-        logger.info(f"  Total rows written : {total_written:,}")
-        logger.info(f"  Total rows skipped : {total_skipped:,}")
-
-        # upload temp file to GCS
-        temp_size_mb = os.path.getsize(temp_path) / 1024 / 1024
-        logger.info(f"  Output size        : {temp_size_mb:.1f} MB")
-        logger.info(f"  Uploading to gs://{BUCKET}/{output_blob}")
-
-        out_blob = bucket.blob(output_blob)
-        with open(temp_path, "rb") as f:
-            out_blob.upload_from_file(
-                f,
-                content_type="application/octet-stream",
-                timeout=900
-            )
-
-        logger.info(f"{tag} uploaded successfully")
-        return True
+        # 3. Final Upload
+        if total_written > 0:
+            out_blob = bucket.blob(output_blob)
+            out_blob.upload_from_filename(temp_parquet, timeout=900)
+            logger.info(f"{tag} success: {total_written:,} rows uploaded")
+            return True
+        return False
 
     except Exception as e:
         logger.error(f"{tag} failed: {e}")
         return False
-
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-            gc.collect()
-
+        if os.path.exists(temp_parquet): os.remove(temp_parquet)
+        gc.collect()
 
 def main():
     gcs_client = storage.Client()
     bucket = gcs_client.bucket(BUCKET)
 
-    logger.info("Starting CSV to Parquet conversion pipeline")
-    logger.info(f"Assets      : {ASSETS}")
-    logger.info(f"Windows     : {WINDOWS}")
-    logger.info(f"Bucket      : {BUCKET}")
-    logger.info(f"Output      : {OUTPUT_PREFIX}")
-
+    logger.info("Starting Memory-Optimized Pipeline")
     total = 0
     failed = []
 
     for start_ym, end_ym in WINDOWS:
-        months = parse_window_months(start_ym, end_ym)
-        for year, month in months:
+        for year, month in parse_window_months(start_ym, end_ym):
             for asset in ASSETS:
-                if asset == "SOLUSDT" and (year, month) < (2020, 11):
-                    logger.info(f"SOLUSDT {year}-{month:02d} skipped, pre-listing")
+                if asset == "SOLUSDT" and (year, month) < (2020, 11): 
                     continue
-                success = process_month(gcs_client, bucket, asset, year, month)
-                if success:
+                
+                if process_month(gcs_client, bucket, asset, year, month):
                     total += 1
                 else:
                     failed.append((asset, year, month))
 
     logger.info("=" * 60)
-    logger.info("Conversion pipeline complete")
+    logger.info("Pipeline complete")
     logger.info(f"Months converted : {total}")
     logger.info(f"Failures         : {len(failed)}")
-
+    
     if failed:
         logger.error("Failed months:")
         for asset, year, month in failed:
             logger.error(f"  {asset} {year}-{month:02d}")
         exit(1)
-
-    logger.info("All months converted successfully")
-
 
 if __name__ == "__main__":
     main()

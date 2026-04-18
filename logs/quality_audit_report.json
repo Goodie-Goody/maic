@@ -1,0 +1,15 @@
+{
+  "audit_date": "2026-04-18",
+  "status": "PASSED",
+  "quality_score": 100.0,
+  "expected_months": 84,
+  "files_present": 84,
+  "files_missing": 0,
+  "files_incomplete": 0,
+  "schema_issues": [],
+  "missing_files": [],
+  "incomplete_files": [],
+  "bq_summary": [],
+  "low_count_days": [],
+  "issues": []
+}
