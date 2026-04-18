@@ -2,10 +2,11 @@ import hashlib
 import io
 import logging
 import os
+import re
 import sys
 import zipfile
-from datetime import datetime, timezone
 from calendar import monthrange
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -31,6 +32,16 @@ DAILY_PATH = "daily/trades"
 MONTHLY_ZIP_PREFIX = "raw/zips/monthly/"
 DAILY_ZIP_PREFIX = "raw/zips/daily/"
 
+MONTHLY_PATTERN = re.compile(
+    r"^(BTCUSDT|ETHUSDT|SOLUSDT)-trades-(\d{4})-(\d{2})\.zip$"
+)
+DAILY_PATTERN = re.compile(
+    r"^(BTCUSDT|ETHUSDT|SOLUSDT)-trades-(\d{4})-(\d{2})-(\d{2})\.zip$"
+)
+
+MIN_MONTHLY_BYTES = 10 * 1024 * 1024
+MIN_DAILY_BYTES = 1 * 1024 * 1024
+
 
 def build_monthly_url(asset, year, month):
     filename = f"{asset}-trades-{year}-{month:02d}.zip"
@@ -54,7 +65,7 @@ def fetch_checksum(url):
 
 
 def download_and_verify(url):
-    response = requests.get(url, timeout=120, stream=True)
+    response = requests.get(url, timeout=300, stream=True)
     if response.status_code == 404:
         return None, "not_found"
     if response.status_code != 200:
@@ -64,7 +75,7 @@ def download_and_verify(url):
 
     buf = io.BytesIO()
     sha256 = hashlib.sha256()
-    for chunk in response.iter_content(chunk_size=8192):
+    for chunk in response.iter_content(chunk_size=65536):
         buf.write(chunk)
         sha256.update(chunk)
 
@@ -111,16 +122,37 @@ def upload_to_gcs(client, buf, destination_blob):
     logger.info(f"Uploaded to gs://{BUCKET}/{destination_blob}")
 
 
-def delete_from_gcs(client, blob_path):
+def gcs_blob_exists(client, blob_path):
+    bucket = client.bucket(BUCKET)
+    return bucket.blob(blob_path).exists()
+
+
+def gcs_blob_size(client, blob_path):
     bucket = client.bucket(BUCKET)
     blob = bucket.blob(blob_path)
-    if blob.exists():
-        blob.delete()
-        logger.info(f"Deleted gs://{BUCKET}/{blob_path}")
+    blob.reload()
+    return blob.size
 
 
-def expected_days(year, month):
-    return set(range(1, monthrange(year, month)[1] + 1))
+def delete_blob(client, blob_path):
+    bucket = client.bucket(BUCKET)
+    blob = bucket.blob(blob_path)
+    blob.delete()
+    logger.info(f"Deleted gs://{BUCKET}/{blob_path}")
+
+
+def build_expected_blobs():
+    expected = set()
+    for start_ym, end_ym in WINDOWS:
+        months = parse_window_months(start_ym, end_ym)
+        for year, month in months:
+            for asset in ASSETS:
+                if asset == "SOLUSDT" and (year, month) < (2020, 11):
+                    continue
+                expected.add(
+                    f"{MONTHLY_ZIP_PREFIX}{asset}-trades-{year}-{month:02d}.zip"
+                )
+    return expected
 
 
 def parse_window_months(start_ym, end_ym):
@@ -137,23 +169,68 @@ def parse_window_months(start_ym, end_ym):
     return months
 
 
-def gcs_blob_exists(client, blob_path):
-    bucket = client.bucket(BUCKET)
-    return bucket.blob(blob_path).exists()
+def expected_days(year, month):
+    return set(range(1, monthrange(year, month)[1] + 1))
 
 
-def cleanup_wrong_paths(client):
-    wrong_prefix = "raw/trades_parquet_flat/raw/"
-    bucket = client.bucket(BUCKET)
-    blobs = list(client.list_blobs(BUCKET, prefix=wrong_prefix))
-    if not blobs:
-        logger.info("No wrongly pathed files found, nothing to clean up")
-        return
-    logger.info(f"Found {len(blobs)} wrongly pathed files, deleting...")
-    for blob in blobs:
+def validate_bucket(client):
+    logger.info("Validating bucket contents")
+    expected_monthly = build_expected_blobs()
+    issues = 0
+
+    # Check monthly prefix
+    monthly_blobs = list(client.list_blobs(BUCKET, prefix=MONTHLY_ZIP_PREFIX))
+    for blob in monthly_blobs:
+        filename = blob.name.split("/")[-1]
+        match = MONTHLY_PATTERN.match(filename)
+
+        if not match:
+            logger.warning(f"Unexpected file found, deleting: {blob.name}")
+            blob.delete()
+            issues += 1
+            continue
+
+        if blob.size < MIN_MONTHLY_BYTES:
+            logger.warning(
+                f"Incomplete monthly file ({blob.size} bytes), deleting: {blob.name}"
+            )
+            blob.delete()
+            issues += 1
+            continue
+
+    # Check daily prefix
+    daily_blobs = list(client.list_blobs(BUCKET, prefix=DAILY_ZIP_PREFIX))
+    for blob in daily_blobs:
+        filename = blob.name.split("/")[-1]
+        match = DAILY_PATTERN.match(filename)
+
+        if not match:
+            logger.warning(f"Unexpected file found, deleting: {blob.name}")
+            blob.delete()
+            issues += 1
+            continue
+
+        if blob.size < MIN_DAILY_BYTES:
+            logger.warning(
+                f"Incomplete daily file ({blob.size} bytes), deleting: {blob.name}"
+            )
+            blob.delete()
+            issues += 1
+            continue
+
+    # Check for old wrong-path files
+    wrong_blobs = list(
+        client.list_blobs(BUCKET, prefix="raw/trades_parquet_flat/raw/")
+    )
+    for blob in wrong_blobs:
+        logger.warning(f"Wrong path file found, deleting: {blob.name}")
         blob.delete()
-        logger.info(f"Deleted gs://{BUCKET}/{blob.name}")
-    logger.info("Cleanup complete")
+        issues += 1
+
+    if issues == 0:
+        logger.info("Bucket validation passed, no issues found")
+    else:
+        logger.info(f"Bucket validation complete, resolved {issues} issues")
 
 
 def process_month(client, asset, year, month):
@@ -161,8 +238,15 @@ def process_month(client, asset, year, month):
     monthly_blob = f"{MONTHLY_ZIP_PREFIX}{asset}-trades-{year}-{month:02d}.zip"
 
     if gcs_blob_exists(client, monthly_blob):
-        logger.info(f"{tag} monthly zip already in GCS, skipping download")
-        return
+        size = gcs_blob_size(client, monthly_blob)
+        if size >= MIN_MONTHLY_BYTES:
+            logger.info(f"{tag} already in GCS and complete, skipping")
+            return
+        else:
+            logger.warning(
+                f"{tag} exists in GCS but incomplete ({size} bytes), re-downloading"
+            )
+            delete_blob(client, monthly_blob)
 
     url, filename = build_monthly_url(asset, year, month)
     logger.info(f"{tag} downloading monthly file")
@@ -202,8 +286,15 @@ def process_month(client, asset, year, month):
         )
 
         if gcs_blob_exists(client, daily_blob):
-            logger.info(f"{tag}-{day:02d} daily zip already in GCS, skipping")
-            continue
+            size = gcs_blob_size(client, daily_blob)
+            if size >= MIN_DAILY_BYTES:
+                logger.info(f"{tag}-{day:02d} already in GCS and complete, skipping")
+                continue
+            else:
+                logger.warning(
+                    f"{tag}-{day:02d} exists but incomplete ({size} bytes), re-downloading"
+                )
+                delete_blob(client, daily_blob)
 
         daily_url, _ = build_daily_url(asset, year, month, day)
         logger.info(f"{tag}-{day:02d} downloading daily file")
@@ -228,8 +319,7 @@ def main():
     logger.info(f"Windows : {WINDOWS}")
     logger.info(f"Bucket  : {BUCKET}")
 
-    logger.info("Cleaning up any wrongly pathed files from previous runs")
-    cleanup_wrong_paths(client)
+    validate_bucket(client)
 
     total = 0
     failed = []
