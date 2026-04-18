@@ -65,7 +65,7 @@ def fetch_checksum(url):
 
 
 def download_and_verify(url):
-    response = requests.get(url, timeout=300, stream=True)
+    response = requests.get(url, timeout=600, stream=True)
     if response.status_code == 404:
         return None, "not_found"
     if response.status_code != 200:
@@ -118,7 +118,7 @@ def upload_to_gcs(client, buf, destination_blob):
     bucket = client.bucket(BUCKET)
     blob = bucket.blob(destination_blob)
     buf.seek(0)
-    blob.upload_from_file(buf, content_type="application/zip", timeout=600)
+    blob.upload_from_file(buf, content_type="application/zip", timeout=900)
     logger.info(f"Uploaded to gs://{BUCKET}/{destination_blob}")
 
 
