@@ -1,4 +1,3 @@
-```markdown
 # MAIC Data Pipeline — Walkthrough
 
 ## Overview
@@ -9,33 +8,20 @@ This walkthrough documents the full data engineering pipeline for the paper "Rea
 
 ---
 
-## Step 0 — GCP Account Setup
+## Step 0 — GCP Account & Infrastructure Setup
 
-Create a GCP account at [console.cloud.google.com](https://console.cloud.google.com). Enable billing by linking a payment method. Once billing is active, open Cloud Shell by clicking the terminal icon in the top right of the GCP console.
+Create a GCP account at [console.cloud.google.com](https://console.cloud.google.com). Enable billing by linking a payment method. Once billing is active, open Cloud Shell by clicking the terminal icon in the top right. Cloud Shell is your orchestration terminal—it has `gcloud` and `bq` pre-installed.
 
-Set your project:
+Set your project and create your storage/database backend:
 
 ```bash
 gcloud config set project your-project-id
-```
 
-Create a GCS bucket in `us-central1`:
-
-```bash
+# Create the GCS bucket in us-central1
 gsutil mb -l us-central1 gs://your-bucket-name
-```
 
-Create a BigQuery dataset:
-
-```bash
+# Create the BigQuery dataset
 bq mk --dataset --location=us-central1 your-project-id:your-dataset-name
-```
-
-Enable the Compute Engine API:
-
-```bash
-gcloud services enable compute.googleapis.com
-```
 
 ---
 
