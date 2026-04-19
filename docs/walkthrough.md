@@ -5,7 +5,7 @@
 
 This walkthrough documents the full data engineering pipeline for the paper "Real-time Liquidity Stress Detection in Cryptocurrency Markets Using Trade Flow Analysis and Machine Learning". It covers everything from GCP account setup to production-ready parquet files in GCS, written so that anyone can replicate the pipeline from scratch.
 
-> **Important:** Cloud Shell is used only for provisioning infrastructure — creating buckets, datasets, and VMs. All data processing scripts must be run on the Compute Engine VM, not in Cloud Shell. Cloud Shell lacks the memory and persistent storage required for multi-gigabyte tick data files.
+> **Important:** Cloud Shell is used only for provisioning infrastructure (creating buckets, datasets, and VMs). All data processing scripts must be run on the Compute Engine VM, not in Cloud Shell. Cloud Shell lacks the memory and persistent storage required for multi-gigabyte tick data files.
 
 ---
 
@@ -430,4 +430,3 @@ The dataset covers five deliberate six-month windows rather than a continuous ti
 ---
 
 *Last updated: April 19, 2026*
-```
