@@ -1,8 +1,13 @@
+Yes exactly — the methodology section gets written after all the technical work is done. Feature engineering, label generation, model training, evaluation — all of it needs to exist before you can write the methodology accurately. The walkthrough keeps expanding as you build.
+
+Here is the updated walkthrough incorporating everything done today:
+
+```markdown
 # MAIC Data Pipeline — Walkthrough
 
 ## Overview
 
-This walkthrough documents the full data engineering pipeline for the paper "Real-time Liquidity Stress Detection in Cryptocurrency Markets Using Trade Flow Analysis and Machine Learning". It covers everything from GCP account setup to production-ready parquet files in GCS, written so that anyone can replicate the pipeline from scratch.
+This walkthrough documents the full data engineering pipeline for the paper "Real-time Liquidity Stress Detection in Cryptocurrency Markets Using Trade Flow Analysis and Machine Learning". It covers everything from GCP account setup to production-ready feature datasets in GCS, written so that anyone can replicate the pipeline from scratch.
 
 > **Important:** Cloud Shell is used only for provisioning infrastructure (creating buckets, datasets, and VMs). All data processing scripts must be run on the Compute Engine VM, not in Cloud Shell. Cloud Shell lacks the memory and persistent storage required for multi-gigabyte tick data files.
 
@@ -10,9 +15,9 @@ This walkthrough documents the full data engineering pipeline for the paper "Rea
 
 ## Step 0 — GCP Account & Infrastructure Setup
 
-Create a GCP account at [console.cloud.google.com](https://console.cloud.google.com). Enable billing by linking a payment method. Once billing is active, open Cloud Shell by clicking the terminal icon in the top right. Cloud Shell is your orchestration terminal—it has `gcloud` and `bq` pre-installed.
+Create a GCP account at [console.cloud.google.com](https://console.cloud.google.com). Enable billing by linking a payment method. Once billing is active, open Cloud Shell by clicking the terminal icon in the top right. Cloud Shell is your orchestration terminal — it has `gcloud` and `bq` pre-installed.
 
-Set your project and create your storage/database backend:
+Set your project and create your storage and database backend:
 
 ```bash
 gcloud config set project your-project-id
@@ -22,6 +27,10 @@ gsutil mb -l us-central1 gs://your-bucket-name
 
 # Create the BigQuery dataset
 bq mk --dataset --location=us-central1 your-project-id:your-dataset-name
+
+# Enable the Compute Engine API
+gcloud services enable compute.googleapis.com
+```
 
 ---
 
@@ -44,7 +53,7 @@ git config --global user.name "Your Name"
 
 GitHub requires a Personal Access Token for pushing via the command line. Generate one at GitHub — Settings — Developer Settings — Personal Access Tokens — Tokens Classic — with `repo` scope.
 
-Configure git to securely cache your token in memory for 10 hours so you are not prompted on every push:
+Configure git to securely cache your token in memory for 10 hours:
 
 ```bash
 git config --global credential.helper 'cache --timeout=36000'
@@ -66,6 +75,8 @@ touch .env.example
 touch scripts/01_download.py
 touch scripts/02_csv_to_parquet.py
 touch scripts/03_quality_audit.py
+touch scripts/04_feature_engineering.py
+touch scripts/verify_features.py
 touch docs/walkthrough.md
 ```
 
@@ -157,6 +168,8 @@ google-cloud-bigquery
 tqdm
 python-dotenv
 requests
+polars
+psutil
 ```
 
 ---
@@ -191,7 +204,7 @@ git push
 
 ## Step 6 — Compute Engine VM Setup
 
-All download and conversion scripts must be run on this VM. Do not run them in Cloud Shell.
+All download, conversion, and feature engineering scripts must be run on this VM. Do not run them in Cloud Shell.
 
 Create the VM from Cloud Shell:
 
@@ -230,7 +243,7 @@ Authenticate Python GCS access:
 gcloud auth application-default login
 ```
 
-This opens a browser link. Complete the sign-in and paste the verification code back into the terminal. Credentials are saved to `~/.config/gcloud/application_default_credentials.json` and picked up automatically by the google-cloud-storage library.
+This opens a browser link. Complete the sign-in and paste the verification code back into the terminal. Credentials are saved to `~/.config/gcloud/application_default_credentials.json` and picked up automatically by the google-cloud-storage and PyArrow GCS filesystem libraries.
 
 Configure git identity and credential cache on the VM:
 
@@ -255,11 +268,6 @@ sudo fallocate -l 8G /swapfile
 sudo chmod 600 /swapfile
 sudo mkswap /swapfile
 sudo swapon /swapfile
-```
-
-Verify swap is active:
-
-```bash
 free -h
 ```
 
@@ -289,10 +297,7 @@ tail -f logs/01_download.log
 Monitor progress:
 
 ```bash
-# files landed in GCS
-gsutil ls gs://your-bucket/raw/zips/monthly/ | wc -l
-
-# any errors or warnings
+gcloud storage ls gs://your-bucket/raw/zips/monthly/ | wc -l
 grep "ERROR\|WARNING" logs/01_download.log
 ```
 
@@ -304,7 +309,7 @@ Reads raw CSV zip files from GCS and converts them to parquet using PyArrow's C+
 
 Output lands in `v2/trades_parquet_flat/` as one parquet file per asset per month. Files are written to local `/tmp/` first then uploaded to GCS to minimise peak RAM usage.
 
-> **Note:** BTCUSDT March 2023 is handled as a known anomaly — the Binance monthly archive for this month only contains days 1–12. The script detects this and stitches the remaining 19 daily files using timestamp filtering.
+> **Note:** BTCUSDT March 2023 is a known anomaly — the Binance monthly archive for this month only contains days 1-12. The script detects this and stitches the remaining 19 daily files using timestamp filtering.
 
 ```bash
 nohup python3 scripts/02_csv_to_parquet.py > logs/02_csv_to_parquet.log 2>&1 &
@@ -315,10 +320,7 @@ tail -f logs/02_csv_to_parquet.log
 Monitor progress:
 
 ```bash
-# parquet files in v2
-gsutil ls gs://your-bucket/v2/trades_parquet_flat/ | wc -l
-
-# disk space on vm
+gcloud storage ls gs://your-bucket/v2/trades_parquet_flat/ | wc -l
 df -h /tmp
 ```
 
@@ -329,23 +331,82 @@ df -h /tmp
 Runs a three-layer audit against the converted parquet files:
 
 1. **File inventory** — checks every expected parquet file exists in GCS and is above the minimum size threshold
-2. **Schema check** — downloads parquet metadata for every file and verifies column names and types match the expected schema exactly
+2. **Schema check** — reads parquet metadata for every file and verifies column names and types match the expected schema exactly
 3. **BigQuery audit** — runs SQL queries against the external table checking null IDs, bad prices, extreme outlier prices above $10M, bad quantities, duplicate trade IDs, timestamp validity, and days with suspiciously low trade counts
 
 Produces a structured JSON report saved to `logs/quality_audit_report.json`. Exits with code 1 if any issues are found.
 
-Before running this script, update the BigQuery external table to point at `v2/trades_parquet_flat/` as described in Step 4.
+Before running, update the BigQuery external table to point at `v2/trades_parquet_flat/` as described in Step 4.
 
 ```bash
 nohup python3 scripts/03_quality_audit.py > logs/03_quality_audit.log 2>&1 &
 echo "PID: $!"
 tail -f logs/03_quality_audit.log
+cat logs/quality_audit_report.json
 ```
 
-Check the report:
+Expected result:
+
+```
+status: PASSED
+quality_score: 100.0
+BTCUSDT: 909 days, 2,442,072,244 trades, 0 duplicates
+ETHUSDT: 909 days, 1,080,172,287 trades, 0 duplicates
+SOLUSDT: 727 days,   485,194,958 trades, 0 duplicates
+```
+
+### Script 4 — Feature Engineering
+
+[`scripts/04_feature_engineering.py`](../scripts/04_feature_engineering.py)
+
+Computes multi-scale microstructure features from raw tick data using a Polars lazy evaluation pipeline with streaming execution. Raw trades are aggregated into 10-second windows using dynamic grouping and upsampled to produce a strictly regular time series — required for LSTM sequence models.
+
+Features are computed at three temporal scales — 10 seconds, 60 seconds, and 300 seconds:
+
+| Feature Group | Features | Scales |
+|---------------|----------|--------|
+| Trade Flow Imbalance | OFI, TCI | 10s, 60s, 300s |
+| Trade Intensity | intensity | 10s, 60s, 300s |
+| Price Impact | ILLIQ, Kyle_lambda | 10s, 60s, 300s |
+| Volatility | RV, VWAP, VWAP_dev | 10s, 60s, 300s |
+| Inter-trade Duration | CV_dt | 10s |
+| Cross-asset Contagion | OFI_corr, Lead_Lag | 60s, 300s |
+
+Cross-asset contagion features are computed using BTC as the market leader for ETH and SOL, and ETH as an additional lead asset for SOL. This reflects the documented price discovery hierarchy in cryptocurrency markets.
+
+Output lands in `v2/features/` as one parquet file per asset per month.
 
 ```bash
-cat logs/quality_audit_report.json
+nohup python3 scripts/04_feature_engineering.py > logs/04_feature_engineering.log 2>&1 &
+echo "PID: $!"
+tail -f logs/04_feature_engineering.log
+```
+
+Monitor progress:
+
+```bash
+gcloud storage ls gs://your-bucket/v2/features/ | wc -l
+grep "RAM used" logs/04_feature_engineering.log
+```
+
+### Verify Feature Dataset
+
+[`scripts/verify_features.py`](../scripts/verify_features.py)
+
+Reads only the parquet metadata footer of each feature file via PyArrow byte-range requests — no full file downloads. Verifies row counts, column counts, and schema consistency across all files. Run after feature engineering completes.
+
+```bash
+python3 scripts/verify_features.py
+```
+
+Expected result:
+
+```
+BTCUSDT: 30 files, 7,853,760 rows, 28 columns
+ETHUSDT: 30 files, 7,853,760 rows, 31 columns
+SOLUSDT: 24 files, 6,281,272 rows, 34 columns
+Grand total: 21,988,792 rows (21.99M observations)
+Audit PASSED: All schemas consistent
 ```
 
 ---
@@ -357,11 +418,6 @@ Once the pipeline is complete and logs confirm success, delete the VM immediatel
 ```bash
 exit
 gcloud compute instances delete pipeline-vm --zone=us-central1-a --quiet
-```
-
-Verify:
-
-```bash
 gcloud compute instances list
 ```
 
@@ -374,6 +430,7 @@ gcloud compute instances list
 | `raw/zips/monthly/` | Raw zip archives from Binance Vision, monthly granularity |
 | `raw/zips/daily/` | Raw zip archives for gap patches, daily granularity |
 | `v2/trades_parquet_flat/` | Production parquet files, one per asset per month |
+| `v2/features/` | Feature parquet files, one per asset per month, 10s windows |
 
 ---
 
@@ -381,11 +438,24 @@ gcloud compute instances list
 
 | Asset | Days Present | Total Trades | Duplicates | Start | End |
 |-------|-------------|--------------|------------|-------|-----|
-| BTCUSDT | 909 | 2,442,072,262 | 0 | 2020-02-01 | 2024-12-31 |
-| ETHUSDT | 909 | 1,080,172,305 | 0 | 2020-02-01 | 2024-12-31 |
-| SOLUSDT | 727 | 485,194,970 | 0 | 2020-11-01 | 2024-12-31 |
+| BTCUSDT | 909 | 2,442,072,244 | 0 | 2020-02-01 | 2024-12-31 |
+| ETHUSDT | 909 | 1,080,172,287 | 0 | 2020-02-01 | 2024-12-31 |
+| SOLUSDT | 727 | 485,194,958 | 0 | 2020-11-01 | 2024-12-31 |
 
 > SOL starts November 2020 — this is expected, not a data gap. SOL was listed on Binance in November 2020.
+
+---
+
+## Feature Dataset Summary
+
+| Asset | Files | Rows | Columns |
+|-------|-------|------|---------|
+| BTCUSDT | 30 | 7,853,760 | 28 |
+| ETHUSDT | 30 | 7,853,760 | 31 |
+| SOLUSDT | 24 | 6,281,272 | 34 |
+| **Total** | **84** | **21,988,792** | — |
+
+BTCUSDT has 28 columns — 26 single-asset features plus `time` and `price`. ETHUSDT has 3 additional BTC cross-asset contagion features. SOLUSDT has 6 additional cross-asset features — 3 from BTC and 3 from ETH.
 
 ---
 
@@ -410,9 +480,11 @@ The dataset covers five deliberate six-month windows rather than a continuous ti
 - `gcloud auth application-default login` is required on the VM before running any Python script that accesses GCS
 - Add swap space before running the conversion script — large files like BTCUSDT November 2022 approach the VM RAM ceiling during processing
 - All scripts are idempotent — safe to re-run if interrupted, already completed files are skipped
-- Scripts 1 and 2 must be run on the VM. Script 3 can be run on the VM or in Cloud Shell since it delegates heavy computation to BigQuery
-- BTCUSDT March 2023 is a known data anomaly at source — the Binance monthly archive only contains days 1–12. The pipeline handles this automatically
+- Scripts 1 through 4 must be run on the VM. Script 3 can also be run in Cloud Shell since it delegates heavy computation to BigQuery
+- BTCUSDT March 2023 is a known data anomaly at source — the Binance monthly archive only contains days 1-12. The pipeline handles this automatically
+- Feature engineering uses Polars lazy evaluation with streaming execution — peak RAM usage stays below 15% on an `e2-highcpu-8` instance regardless of file size
 
 ---
 
 *Last updated: April 19, 2026*
+```
