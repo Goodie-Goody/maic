@@ -1,4 +1,3 @@
-```markdown
 # MAIC Data Pipeline — Walkthrough
 
 ## Overview
