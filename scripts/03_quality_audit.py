@@ -1,16 +1,17 @@
 import sys
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 import json
 import logging
 from datetime import date
 from calendar import monthrange
 
 import pyarrow.parquet as pq
+from pyarrow import fs
 from google.cloud import bigquery
 from google.cloud import storage
 
+# Ensure config is accessible
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     ASSETS,
     BUCKET,
@@ -30,7 +31,6 @@ logger = logging.getLogger(__name__)
 OUTPUT_PREFIX = "v2/trades_parquet_flat/"
 REPORT_PATH = "logs/quality_audit_report.json"
 
-
 def parse_window_months(start_ym, end_ym):
     months = []
     sy, sm = int(start_ym[:4]), int(start_ym[5:])
@@ -44,7 +44,6 @@ def parse_window_months(start_ym, end_ym):
             y += 1
     return months
 
-
 def get_expected_months():
     expected = []
     for start_ym, end_ym in WINDOWS:
@@ -54,7 +53,6 @@ def get_expected_months():
                     continue
                 expected.append((asset, year, month))
     return expected
-
 
 def check_file_inventory(bucket, expected_months):
     logger.info("Checking file inventory")
@@ -90,9 +88,8 @@ def check_file_inventory(bucket, expected_months):
 
     return results, missing_files, incomplete_files
 
-
-def check_schema(bucket, expected_months):
-    logger.info("Checking schema consistency")
+def check_schema(expected_months):
+    logger.info("Checking schema consistency across ALL files (Footer-only read)")
     schema_issues = []
 
     expected_fields = {
@@ -105,36 +102,43 @@ def check_schema(bucket, expected_months):
         "is_best_match": "bool",
     }
 
-    for asset, year, month in expected_months[:3]:
-        blob_path = f"{OUTPUT_PREFIX}{asset}-trades-{year}-{month:02d}.parquet"
-        blob = bucket.blob(blob_path)
+    # Initialize the PyArrow GCS File System for byte-range requests
+    gcs = fs.GcsFileSystem()
 
-        if not blob.exists():
-            continue
+    for asset, year, month in expected_months:
+        gcs_path = f"{BUCKET}/{OUTPUT_PREFIX}{asset}-trades-{year}-{month:02d}.parquet"
 
-        import io
-        buf = io.BytesIO()
-        blob.download_to_file(buf)
-        buf.seek(0)
+        try:
+            # Reads ONLY the metadata footer, skipping the massive data blocks
+            with gcs.open_input_file(gcs_path) as file_handle:
+                schema = pq.read_schema(file_handle)
 
-        pf = pq.ParquetFile(buf)
-        schema = pf.schema_arrow
-
-        for field in schema:
-            expected_type = expected_fields.get(field.name)
-            actual_type = str(field.type)
-            if expected_type and actual_type != expected_type:
-                issue = f"{blob_path}: {field.name} expected {expected_type} got {actual_type}"
-                logger.warning(issue)
-                schema_issues.append(issue)
+            for field in schema:
+                expected_type = expected_fields.get(field.name)
+                actual_type = str(field.type)
+                if expected_type and actual_type != expected_type:
+                    issue = f"{gcs_path}: {field.name} expected {expected_type} got {actual_type}"
+                    logger.warning(issue)
+                    schema_issues.append(issue)
+                    
+        except Exception as e:
+            issue = f"Failed to read schema for {gcs_path}: {e}"
+            logger.warning(issue)
+            schema_issues.append(issue)
 
     if not schema_issues:
-        logger.info("Schema consistent across sampled files")
+        logger.info("Schema consistent across all files")
 
     return schema_issues
 
-
 def run_bq_audit(bq_client):
+    logger.info("Refreshing BigQuery External Table Cache")
+    try:
+        # Forces BigQuery to scan the GCS bucket for your newly converted v2 files
+        bq_client.query(f"CALL BQ.REFRESH_EXTERNAL_TABLE('{PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}')").result()
+    except Exception as e:
+        logger.debug(f"Cache refresh skipped (likely a native table, not external): {e}")
+
     logger.info("Running BigQuery audit queries")
 
     summary_query = f"""
@@ -144,6 +148,7 @@ def run_bq_audit(bq_client):
         COUNT(*) AS total_trades,
         COUNT(*) - COUNT(DISTINCT id) AS duplicates,
         COUNTIF(price <= 0) AS bad_prices,
+        COUNTIF(price > 10000000) AS extreme_prices,
         COUNTIF(qty <= 0) AS bad_quantities,
         COUNTIF(id IS NULL) AS null_ids,
         COUNTIF(time IS NULL) AS null_timestamps,
@@ -162,6 +167,7 @@ def run_bq_audit(bq_client):
     logger.info("Running summary audit")
     summary_results = []
     rows = bq_client.query(summary_query).result()
+    
     for row in rows:
         result = {
             "asset": row.asset,
@@ -169,6 +175,7 @@ def run_bq_audit(bq_client):
             "total_trades": row.total_trades,
             "duplicates": row.duplicates,
             "bad_prices": row.bad_prices,
+            "extreme_prices": row.extreme_prices,
             "bad_quantities": row.bad_quantities,
             "null_ids": row.null_ids,
             "null_timestamps": row.null_timestamps,
@@ -225,7 +232,6 @@ def run_bq_audit(bq_client):
 
     return summary_results, low_count_days
 
-
 def assess_overall_quality(summary_results, missing_files, incomplete_files, schema_issues, low_count_days):
     issues = []
 
@@ -241,6 +247,8 @@ def assess_overall_quality(summary_results, missing_files, incomplete_files, sch
             issues.append(f"{result['asset']} has {result['duplicates']} duplicate trade IDs")
         if result["bad_prices"] > 0:
             issues.append(f"{result['asset']} has {result['bad_prices']} bad prices")
+        if result["extreme_prices"] > 0:
+            issues.append(f"{result['asset']} has {result['extreme_prices']} extreme outlier prices")
         if result["bad_quantities"] > 0:
             issues.append(f"{result['asset']} has {result['bad_quantities']} bad quantities")
         if result["null_ids"] > 0:
@@ -260,13 +268,12 @@ def assess_overall_quality(summary_results, missing_files, incomplete_files, sch
 
     return status, score, issues
 
-
 def main():
     gcs_client = storage.Client()
     bq_client = bigquery.Client(project=PROJECT_ID)
     bucket = gcs_client.bucket(BUCKET)
 
-    logger.info("Starting quality audit")
+    logger.info("Starting comprehensive quality audit")
     logger.info(f"Bucket   : {BUCKET}")
     logger.info(f"Prefix   : {OUTPUT_PREFIX}")
     logger.info(f"BQ table : {PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}")
@@ -279,8 +286,8 @@ def main():
         bucket, expected_months
     )
 
-    # schema check
-    schema_issues = check_schema(bucket, expected_months)
+    # schema check (Updated to use PyArrow GCS FileSystem)
+    schema_issues = check_schema(expected_months)
 
     # bigquery audit
     summary_results, low_count_days = run_bq_audit(bq_client)
@@ -319,13 +326,12 @@ def main():
     logger.info(f"Report saved : {REPORT_PATH}")
 
     if issues:
-        logger.error("Issues found:")
+        logger.error("Critical Data Issues found:")
         for issue in issues:
             logger.error(f"  {issue}")
         exit(1)
 
     logger.info("Dataset passed all quality checks")
-
 
 if __name__ == "__main__":
     main()

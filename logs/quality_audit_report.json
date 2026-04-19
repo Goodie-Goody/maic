@@ -9,7 +9,47 @@
   "schema_issues": [],
   "missing_files": [],
   "incomplete_files": [],
-  "bq_summary": [],
+  "bq_summary": [
+    {
+      "asset": "BTCUSDT",
+      "days_present": 909,
+      "total_trades": 2442072244,
+      "duplicates": 0,
+      "bad_prices": 0,
+      "extreme_prices": 0,
+      "bad_quantities": 0,
+      "null_ids": 0,
+      "null_timestamps": 0,
+      "dataset_start": "2020-02-01 00:00:00.580000+00:00",
+      "dataset_end": "2024-12-31 23:59:59.951000+00:00"
+    },
+    {
+      "asset": "ETHUSDT",
+      "days_present": 909,
+      "total_trades": 1080172287,
+      "duplicates": 0,
+      "bad_prices": 0,
+      "extreme_prices": 0,
+      "bad_quantities": 0,
+      "null_ids": 0,
+      "null_timestamps": 0,
+      "dataset_start": "2020-02-01 00:00:01.626000+00:00",
+      "dataset_end": "2024-12-31 23:59:57.163000+00:00"
+    },
+    {
+      "asset": "SOLUSDT",
+      "days_present": 727,
+      "total_trades": 485194958,
+      "duplicates": 0,
+      "bad_prices": 0,
+      "extreme_prices": 0,
+      "bad_quantities": 0,
+      "null_ids": 0,
+      "null_timestamps": 0,
+      "dataset_start": "2020-11-01 00:00:01.517000+00:00",
+      "dataset_end": "2024-12-31 23:59:59.676000+00:00"
+    }
+  ],
   "low_count_days": [],
   "issues": []
 }
