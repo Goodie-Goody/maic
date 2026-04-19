@@ -1,7 +1,3 @@
-Yes exactly — the methodology section gets written after all the technical work is done. Feature engineering, label generation, model training, evaluation — all of it needs to exist before you can write the methodology accurately. The walkthrough keeps expanding as you build.
-
-Here is the updated walkthrough incorporating everything done today:
-
 ```markdown
 # MAIC Data Pipeline — Walkthrough
 
