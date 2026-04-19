@@ -98,6 +98,7 @@ def load_asset_features(gcs_client, bucket, asset):
 
 def fit_hmm(df, asset):
     logger.info(f"Fitting {N_STATES}-state Gaussian HMM on {asset}")
+    logger.info(f"  Covariance type: diag (faster, comparable accuracy for regime detection)")
 
     X = df.select(HMM_FEATURES).to_numpy()
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
@@ -107,7 +108,7 @@ def fit_hmm(df, asset):
 
     model = GaussianHMM(
         n_components=N_STATES,
-        covariance_type="full",
+        covariance_type="diag",
         n_iter=N_ITER,
         random_state=RANDOM_STATE,
         verbose=False,
@@ -155,6 +156,7 @@ def fit_hmm(df, asset):
             "state_map": state_map,
             "hmm_features": HMM_FEATURES,
             "n_states": N_STATES,
+            "covariance_type": "diag",
         }, f)
     logger.info(f"  Saved model and scaler to {model_path}")
 
@@ -239,6 +241,7 @@ def main():
     logger.info(f"HMM features : {HMM_FEATURES}")
     logger.info(f"Iterations   : {N_ITER}")
     logger.info(f"Scaling      : StandardScaler (zero mean, unit variance)")
+    logger.info(f"Covariance   : diag")
 
     failed = []
 
