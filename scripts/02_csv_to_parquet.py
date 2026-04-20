@@ -94,6 +94,11 @@ def process_csv_from_zip(zip_path, writer, tag):
         if not csv_files:
             logger.warning(f"  {tag} no CSV files found in zip")
             return 0
+            
+        # ANOMALY FIX: Guard against duplicated files in Binance Zips
+        if len(csv_files) > 1:
+            logger.warning(f"  {tag} Multiple CSVs in zip ({len(csv_files)}), using only the first: {csv_files[0]}")
+            csv_files = csv_files[:1]
 
         for csv_name in csv_files:
             logger.info(f"  Processing {csv_name} via PyArrow Streaming")
@@ -131,6 +136,14 @@ def process_csv_with_timestamp_tracking(zip_path, writer, tag, filter_after=None
 
     with zipfile.ZipFile(zip_path) as zf:
         csv_files = [n for n in zf.namelist() if n.endswith(".csv")]
+        if not csv_files:
+            return 0, max_ts
+            
+        # ANOMALY FIX: Guard against duplicated files in Binance Zips
+        if len(csv_files) > 1:
+            logger.warning(f"  {tag} Multiple CSVs in zip ({len(csv_files)}), using only the first: {csv_files[0]}")
+            csv_files = csv_files[:1]
+            
         for csv_name in csv_files:
             with zf.open(csv_name) as f:
                 reader = pcsv.open_csv(
