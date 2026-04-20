@@ -27,7 +27,6 @@ FEATURES_PREFIX = "v2/features/"
 LABELS_PREFIX = "v2/labels/"
 N_STATES = 3
 N_ITER = 100
-RANDOM_STATE = 42
 
 HMM_FEATURES = [
     "RV_300s",
@@ -98,7 +97,8 @@ def load_asset_features(gcs_client, bucket, asset):
 
 def fit_hmm(df, asset):
     logger.info(f"Fitting {N_STATES}-state Gaussian HMM on {asset}")
-    logger.info(f"  Covariance type: diag (faster, comparable accuracy for regime detection)")
+    logger.info(f"  Covariance type: diag")
+    logger.info(f"  Running 5 seeds, keeping best log likelihood")
 
     X = df.select(HMM_FEATURES).to_numpy()
     X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
@@ -106,24 +106,33 @@ def fit_hmm(df, asset):
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
 
-    model = GaussianHMM(
-        n_components=N_STATES,
-        covariance_type="diag",
-        n_iter=N_ITER,
-        random_state=RANDOM_STATE,
-        verbose=False,
-    )
+    best_model = None
+    best_score = -np.inf
+    best_seed_val = 0
 
-    model.fit(X_scaled)
+    for seed in range(5):
+        model = GaussianHMM(
+            n_components=N_STATES,
+            covariance_type="diag",
+            n_iter=N_ITER,
+            random_state=seed,
+            verbose=False,
+        )
+        model.fit(X_scaled)
+        score = model.score(X_scaled)
+        logger.info(f"  Seed {seed}: log likelihood {score:.4f}, converged: {model.monitor_.converged}")
+        if score > best_score:
+            best_score = score
+            best_model = model
+            best_seed_val = seed
 
-    logger.info(f"  HMM converged: {model.monitor_.converged}")
-    logger.info(f"  Log likelihood: {model.monitor_.history[-1]:.4f}")
+    logger.info(f"  Best log likelihood: {best_score:.4f} (Seed {best_seed_val})")
 
-    states = model.predict(X_scaled)
+    states = best_model.predict(X_scaled)
 
     rv_idx = HMM_FEATURES.index("RV_300s")
     state_means = {
-        s: model.means_[s][rv_idx]
+        s: best_model.means_[s][rv_idx]
         for s in range(N_STATES)
     }
 
@@ -142,7 +151,7 @@ def fit_hmm(df, asset):
         logger.info(f"  State {label} ({name}): {count:,} observations ({pct:.1f}%)")
 
     logger.info("  Transition matrix (rows=from, cols=to):")
-    tm = model.transmat_
+    tm = best_model.transmat_
     for i in range(N_STATES):
         row = " ".join([f"{tm[i][j]:.3f}" for j in range(N_STATES)])
         logger.info(f"    State {i}: [{row}]")
@@ -151,16 +160,17 @@ def fit_hmm(df, asset):
     model_path = f"logs/{asset}_hmm_model.pkl"
     with open(model_path, "wb") as f:
         pickle.dump({
-            "model": model,
+            "model": best_model,
             "scaler": scaler,
             "state_map": state_map,
             "hmm_features": HMM_FEATURES,
             "n_states": N_STATES,
             "covariance_type": "diag",
+            "best_seed": best_seed_val,
         }, f)
     logger.info(f"  Saved model and scaler to {model_path}")
 
-    return mapped_states, model, scaler, state_map
+    return mapped_states, best_model, scaler, state_map
 
 
 def validate_against_events(df, states, asset):
@@ -236,12 +246,11 @@ def main():
     gcs_client = storage.Client()
     bucket = gcs_client.bucket(BUCKET)
 
-    logger.info("Starting Label Generation Pipeline")
+    logger.info("Starting Label Generation Pipeline (Targeted Rerun)")
     logger.info(f"States       : {N_STATES}")
     logger.info(f"HMM features : {HMM_FEATURES}")
     logger.info(f"Iterations   : {N_ITER}")
     logger.info(f"Scaling      : StandardScaler (zero mean, unit variance)")
-    logger.info(f"Covariance   : diag")
 
     failed = []
 
@@ -251,7 +260,7 @@ def main():
 
         try:
             df = load_asset_features(gcs_client, bucket, asset)
-            mapped_states, model, scaler, state_map = fit_hmm(df, asset)
+            mapped_states, best_model, scaler, state_map = fit_hmm(df, asset)
             validate_against_events(df, mapped_states, asset)
             save_labels(gcs_client, bucket, asset, df, mapped_states)
 
@@ -263,13 +272,13 @@ def main():
         gc.collect()
 
     logger.info("=" * 60)
-    logger.info("Label Generation Complete")
+    logger.info("Targeted Label Generation Complete")
 
     if failed:
         logger.error(f"Failed assets: {failed}")
         sys.exit(1)
 
-    logger.info("All assets labeled successfully")
+    logger.info("ETHUSDT labeled successfully")
 
 
 if __name__ == "__main__":

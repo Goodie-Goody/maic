@@ -1,3 +1,7 @@
+hmmlearn
+psutil
+uv
+polars
 pyarrow
 pandas
 google-cloud-storage

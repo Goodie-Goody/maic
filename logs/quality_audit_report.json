@@ -1,9 +1,9 @@
 {
-  "audit_date": "2026-04-18",
+  "audit_date": "2026-04-20",
   "status": "PASSED",
   "quality_score": 100.0,
-  "expected_months": 84,
-  "files_present": 84,
+  "expected_months": 90,
+  "files_present": 90,
   "files_missing": 0,
   "files_incomplete": 0,
   "schema_issues": [],
@@ -12,8 +12,8 @@
   "bq_summary": [
     {
       "asset": "BTCUSDT",
-      "days_present": 909,
-      "total_trades": 2442072244,
+      "days_present": 971,
+      "total_trades": 2570682192,
       "duplicates": 0,
       "bad_prices": 0,
       "extreme_prices": 0,
@@ -25,8 +25,8 @@
     },
     {
       "asset": "ETHUSDT",
-      "days_present": 909,
-      "total_trades": 1080172287,
+      "days_present": 971,
+      "total_trades": 1191086501,
       "duplicates": 0,
       "bad_prices": 0,
       "extreme_prices": 0,
@@ -38,8 +38,8 @@
     },
     {
       "asset": "SOLUSDT",
-      "days_present": 727,
-      "total_trades": 485194958,
+      "days_present": 789,
+      "total_trades": 516787062,
       "duplicates": 0,
       "bad_prices": 0,
       "extreme_prices": 0,
