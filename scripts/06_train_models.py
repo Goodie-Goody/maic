@@ -231,22 +231,20 @@ class CNNGAFClassifier(nn.Module):
 
 def train_lstm(X_train, y_train, X_test, y_test, class_weights, n_classes):
     input_dim = X_train.shape[1]
-    
-    # REGULARISATION TWEAKS APPLIED HERE
+
     model = LSTMClassifier(
         input_dim=input_dim,
-        hidden_dim=64,             # Reduced from 128
+        hidden_dim=64,
         num_layers=2,
         n_classes=n_classes,
-        dropout=0.5                # Increased from 0.2
+        dropout=0.5
     ).to(DEVICE)
 
     weight_tensor = torch.FloatTensor(class_weights).to(DEVICE)
     criterion = nn.CrossEntropyLoss(weight=weight_tensor)
-    
-    # WEIGHT DECAY APPLIED HERE
+
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-    
+
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, patience=3, factor=0.5
     )
@@ -467,19 +465,20 @@ def compute_integrated_gradients(model, X_test, y_test, feature_names, n_classes
         ig = IntegratedGradients(model)
         all_attrs = []
 
-        for batch_x, batch_y in loader:
-            batch_x = batch_x.to(DEVICE).requires_grad_(True)
-            baseline = torch.zeros_like(batch_x).to(DEVICE)
+        with torch.backends.cudnn.flags(enabled=False):
+            for batch_x, batch_y in loader:
+                batch_x = batch_x.to(DEVICE).requires_grad_(True)
+                baseline = torch.zeros_like(batch_x).to(DEVICE)
 
-            for c in range(n_classes):
-                attrs = ig.attribute(batch_x, baseline, target=c)
-                all_attrs.append(attrs.mean(dim=1).abs().cpu().detach().numpy())
+                for c in range(n_classes):
+                    attrs = ig.attribute(batch_x, baseline, target=c)
+                    all_attrs.append(attrs.mean(dim=1).abs().cpu().detach().numpy())
 
-            if len(all_attrs) >= 10:
-                break
+                if len(all_attrs) >= 10:
+                    break
 
         mean_attrs = np.mean(all_attrs, axis=0)
-        importance = dict(zip(feature_names, mean_attrs.mean(axis=0)))
+        importance = {k: float(v) for k, v in zip(feature_names, mean_attrs.mean(axis=0))}
         return importance
     except Exception as e:
         logger.warning(f"    Integrated Gradients failed: {e}")
@@ -744,7 +743,7 @@ def run_fold(
         )
         predictions["lstm"] = lstm_probs
         metrics["lstm"] = classification_report(
-            y_test[SEQ_LENGTH - 1:], lstm_preds,
+            y_test[SEQ_LENGTH:], lstm_preds,
             target_names=label_names, output_dict=True
         )
 
@@ -773,7 +772,7 @@ def run_fold(
         )
         predictions["cnn_gaf"] = cnn_probs
         metrics["cnn_gaf"] = classification_report(
-            y_test[SEQ_LENGTH - 1:], cnn_preds,
+            y_test[SEQ_LENGTH:], cnn_preds,
             target_names=label_names, output_dict=True
         )
 
@@ -912,4 +911,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
+    
