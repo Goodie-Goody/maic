@@ -7,6 +7,7 @@ import pickle
 import tempfile
 import random
 from datetime import datetime
+import warnings
 
 import numpy as np
 import polars as pl
@@ -33,6 +34,9 @@ from google.cloud import storage
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import ASSETS, BUCKET, WINDOWS
+
+# Suppress annoying third-party warnings for clean logs
+warnings.filterwarnings("ignore", category=UserWarning)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -74,16 +78,21 @@ COMMON_FEATURES = [
 
 
 def set_seed(seed=42):
-    """Locks all randomness for baseline reproducibility."""
+    """Locks all randomness for baseline reproducibility using modern APIs."""
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
-    np.random.seed(seed)
+    
+    # Modern NumPy RNG (prevents global state warnings)
+    rng = np.random.default_rng(seed)
+    
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        
+    return rng
 
 
 def compute_gasf_pytorch(x):
@@ -115,7 +124,7 @@ def compute_gasf_pytorch(x):
 
 def parse_window_months(start_ym, end_ym):
     months = []
-    sy, sm = int(start_ym[:4]), int(start_ym[5:] )
+    sy, sm = int(start_ym[:4]), int(start_ym[5:])
     ey, em = int(end_ym[:4]), int(end_ym[5:])
     y, m = sy, sm
     while (y, m) <= (ey, em):
@@ -258,7 +267,7 @@ class CNNGAFClassifier(nn.Module):
     def forward(self, x):
         x = self.pool(self.relu(self.conv1(x)))
         x = self.pool(self.relu(self.conv2(x)))
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
         x = self.dropout(self.relu(self.fc1(x)))
         return self.fc2(x)
 
@@ -625,8 +634,10 @@ def run_fold(
         lr_weights = {i: w for i, w in enumerate(class_weights)}
         lr = LogisticRegression(class_weight=lr_weights, max_iter=2000, n_jobs=-1, C=1.0)
         lr.fit(X_train_sc, y_train)
-        lr_preds = lr.predict(X_test_sc)  # PREDICTION EFFICIENCY FIX
-        predictions["lr"], metrics["lr"] = lr.predict_proba(X_test_sc), classification_report(y_test, lr_preds, target_names=label_names, output_dict=True)
+        lr_preds = lr.predict(X_test_sc)
+        lr_probs = lr.predict_proba(X_test_sc)
+        predictions["lr"] = lr_probs
+        metrics["lr"] = classification_report(y_test, lr_preds, target_names=label_names, output_dict=True)
         
         shap_result = compute_shap(lr, X_train_sc, X_test_sc, feat_names, "lr")
         if shap_result: plot_shap_summary(shap_result[0], shap_result[1], feat_names, f"LR SHAP - {tag} {mode}", f"{output_dir}/shap_lr_{mode}.png")
@@ -635,8 +646,10 @@ def run_fold(
         rf_weights = {i: w for i, w in enumerate(class_weights)}
         rf = RandomForestClassifier(n_estimators=200, max_depth=12, class_weight=rf_weights, n_jobs=-1, random_state=42)
         rf.fit(X_train_sc, y_train)
-        rf_preds = rf.predict(X_test_sc)  # PREDICTION EFFICIENCY FIX
-        predictions["rf"], metrics["rf"] = rf.predict_proba(X_test_sc), classification_report(y_test, rf_preds, target_names=label_names, output_dict=True)
+        rf_preds = rf.predict(X_test_sc)
+        rf_probs = rf.predict_proba(X_test_sc)
+        predictions["rf"] = rf_probs
+        metrics["rf"] = classification_report(y_test, rf_preds, target_names=label_names, output_dict=True)
         
         shap_result = compute_shap(rf, X_train_sc, X_test_sc, feat_names, "rf")
         if shap_result: plot_shap_summary(shap_result[0], shap_result[1], feat_names, f"RF SHAP - {tag} {mode}", f"{output_dir}/shap_rf_{mode}.png")
@@ -651,8 +664,10 @@ def run_fold(
         if binary: xgb_params.pop("num_class")
         xgb_model = xgb.XGBClassifier(**xgb_params)
         xgb_model.fit(X_train_sc, y_train, sample_weight=sample_weight)
-        xgb_preds = xgb_model.predict(X_test_sc)  # PREDICTION EFFICIENCY FIX
-        predictions["xgb"], metrics["xgb"] = xgb_model.predict_proba(X_test_sc), classification_report(y_test, xgb_preds, target_names=label_names, output_dict=True)
+        xgb_preds = xgb_model.predict(X_test_sc)
+        xgb_probs = xgb_model.predict_proba(X_test_sc)
+        predictions["xgb"] = xgb_probs
+        metrics["xgb"] = classification_report(y_test, xgb_preds, target_names=label_names, output_dict=True)
 
         shap_result = compute_shap(xgb_model, X_train_sc, X_test_sc, feat_names, "xgb")
         if shap_result: plot_shap_summary(shap_result[0], shap_result[1], feat_names, f"XGB SHAP - {tag} {mode}", f"{output_dir}/shap_xgb_{mode}.png")
@@ -675,7 +690,7 @@ def run_fold(
         metrics["cnn_gaf"] = classification_report(y_test[SEQ_LENGTH:], cnn_preds, target_names=label_names, output_dict=True)
         plot_loss_curves(cnn_tl, cnn_vl, "CNN-GAF", f"{tag} {mode}", f"{output_dir}/loss_cnn_{mode}.png")
 
-        # PLOTTING FIX: Use stored predictions
+        # Use stored predictions for matrices
         for model_name, preds in [("lr", lr_preds), ("rf", rf_preds), ("xgb", xgb_preds)]:
             plot_confusion_matrix(y_test, preds, label_names, f"{model_name.upper()} - {tag} {mode}", f"{output_dir}/cm_{model_name}_{mode}.png")
 
