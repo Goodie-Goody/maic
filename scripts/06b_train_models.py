@@ -583,11 +583,11 @@ def run_fold(
         for a in pooled_assets:
             for w in train_windows:
                 df = load_window_data(bucket, a, w, feature_cols)
-                if df is not None:
+                if df is not None and not df.is_empty():
                     df = df.with_columns(pl.lit(pooled_assets.index(a)).alias("asset_id"))
                     train_frames.append(df)
             df = load_window_data(bucket, a, test_window, feature_cols)
-            if df is not None:
+            if df is not None and not df.is_empty():
                 df = df.with_columns(pl.lit(pooled_assets.index(a)).alias("asset_id"))
                 test_frames.append(df)
 
@@ -599,10 +599,16 @@ def run_fold(
         test_df = pl.concat(test_frames).sort("time")
     else:
         train_frames = [load_window_data(bucket, asset, w, feature_cols) for w in train_windows]
-        train_df = pl.concat([f for f in train_frames if f is not None]).sort("time")
+        valid_train_frames = [f for f in train_frames if f is not None and not f.is_empty()]
+        
+        if not valid_train_frames:
+            logger.warning(f"  {tag} no valid training data, skipping")
+            return
+            
+        train_df = pl.concat(valid_train_frames).sort("time")
         test_df = load_window_data(bucket, asset, test_window, feature_cols)
 
-    if test_df is None or train_df.is_empty():
+    if test_df is None or test_df.is_empty() or train_df.is_empty():
         logger.warning(f"  {tag} no data, skipping")
         return
 
