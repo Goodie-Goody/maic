@@ -827,6 +827,16 @@ def run_ablation_condition(gcs_client, bucket, fold, train_windows, test_window,
             mark_stage_complete(bucket, fold, condition, mode, "lr")
 
         # ── Random Forest ────────────────────────────────────────────────────
+        # Aggressive memory cleanup before RF — ablation runs fold 4 which is
+        # 18.8M rows. Same OOM risk as 06b. malloc_trim returns fragmented heap
+        # pages to the OS before RF tries to allocate for 200 trees.
+        import ctypes
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            logger.info("    malloc_trim: heap released to OS")
+        except Exception as e:
+            logger.warning(f"    malloc_trim failed (non-fatal): {e}")
 
         if stage_already_complete(bucket, fold, condition, mode, "rf"):
             logger.info("    RF already complete — loading saved outputs")
