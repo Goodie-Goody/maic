@@ -29,7 +29,7 @@ import xgboost as xgb
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import GradScaler, autocast  # [OPT] Mixed precision imports
+from torch.amp import GradScaler, autocast  # [OPT] Mixed precision imports
 from captum.attr import IntegratedGradients
 from google.cloud import storage
 
@@ -455,7 +455,7 @@ def train_lstm(X_train, y_train, X_test, y_test, class_weights, n_classes):
     criterion     = nn.CrossEntropyLoss(weight=weight_tensor)
     optimizer     = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     scheduler     = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.5)
-    amp_scaler    = GradScaler()  # [OPT] BF16 AMP loss scaler
+    amp_scaler    = GradScaler("cuda")  # [OPT] BF16 AMP loss scaler
 
     train_ds = TimeSeriesDataset(X_train, y_train, SEQ_LENGTH)
     test_ds  = TimeSeriesDataset(X_test,  y_test,  SEQ_LENGTH)
@@ -479,7 +479,7 @@ def train_lstm(X_train, y_train, X_test, y_test, class_weights, n_classes):
             # [OPT] BF16 autocast: Blackwell natively supports BF16 tensor cores.
             # BF16 preferred over FP16 for financial data — wider dynamic range,
             # no NaN risk from large magnitude spikes in market microstructure features.
-            with autocast(dtype=torch.bfloat16):
+            with autocast("cuda", dtype=torch.bfloat16):
                 outputs = model(batch_x)
                 loss    = criterion(outputs, batch_y)
 
@@ -499,7 +499,7 @@ def train_lstm(X_train, y_train, X_test, y_test, class_weights, n_classes):
             for batch_x, batch_y in test_loader:
                 batch_x = batch_x.to(DEVICE, non_blocking=True)
                 batch_y = batch_y.to(DEVICE, non_blocking=True)
-                with autocast(dtype=torch.bfloat16):
+                with autocast("cuda", dtype=torch.bfloat16):
                     outputs   = model(batch_x)
                     val_loss += criterion(outputs, batch_y).item()
 
@@ -527,7 +527,7 @@ def train_lstm(X_train, y_train, X_test, y_test, class_weights, n_classes):
     with torch.no_grad():
         for batch_x, _ in test_loader:
             batch_x = batch_x.to(DEVICE, non_blocking=True)
-            with autocast(dtype=torch.bfloat16):
+            with autocast("cuda", dtype=torch.bfloat16):
                 outputs = model(batch_x)
             # Cast to float32 before softmax — BF16 softmax can be numerically unstable
             all_probs.extend(torch.softmax(outputs.float(), dim=1).cpu().numpy())
@@ -554,7 +554,7 @@ def train_cnn_gaf(X_train, y_train, X_test, y_test, class_weights, n_classes, se
     weight_tensor = torch.FloatTensor(class_weights).to(DEVICE)
     criterion     = nn.CrossEntropyLoss(weight=weight_tensor)
     optimizer     = torch.optim.Adam(model.parameters(), lr=0.001)
-    amp_scaler    = GradScaler()
+    amp_scaler    = GradScaler("cuda")
 
     train_losses, val_losses = [], []
     best_val_loss    = np.inf
@@ -569,7 +569,7 @@ def train_cnn_gaf(X_train, y_train, X_test, y_test, class_weights, n_classes, se
             batch_x = batch_x.to(DEVICE, non_blocking=True)
             batch_y = batch_y.to(DEVICE, non_blocking=True)
 
-            with autocast(dtype=torch.bfloat16):
+            with autocast("cuda", dtype=torch.bfloat16):
                 batch_x_gaf = compute_gasf_pytorch(batch_x)
                 outputs     = model(batch_x_gaf)
                 loss        = criterion(outputs, batch_y)
@@ -589,7 +589,7 @@ def train_cnn_gaf(X_train, y_train, X_test, y_test, class_weights, n_classes, se
             for batch_x, batch_y in test_loader:
                 batch_x = batch_x.to(DEVICE, non_blocking=True)
                 batch_y = batch_y.to(DEVICE, non_blocking=True)
-                with autocast(dtype=torch.bfloat16):
+                with autocast("cuda", dtype=torch.bfloat16):
                     batch_x_gaf = compute_gasf_pytorch(batch_x)
                     outputs     = model(batch_x_gaf)
                     val_loss   += criterion(outputs, batch_y).item()
@@ -617,7 +617,7 @@ def train_cnn_gaf(X_train, y_train, X_test, y_test, class_weights, n_classes, se
     with torch.no_grad():
         for batch_x, _ in test_loader:
             batch_x = batch_x.to(DEVICE, non_blocking=True)
-            with autocast(dtype=torch.bfloat16):
+            with autocast("cuda", dtype=torch.bfloat16):
                 batch_x_gaf = compute_gasf_pytorch(batch_x)
                 outputs     = model(batch_x_gaf)
             all_probs.extend(torch.softmax(outputs.float(), dim=1).cpu().numpy())
@@ -849,7 +849,7 @@ def run_fold(
             logger.info("    Training Logistic Regression")
             lr = LogisticRegression(
                 class_weight={i: w for i, w in enumerate(class_weights)},
-                max_iter=2000, n_jobs=-1, C=1.0
+                max_iter=2000, C=1.0
             )
             lr.fit(X_train_sc, y_train)
             lr_preds = lr.predict(X_test_sc)
@@ -872,6 +872,17 @@ def run_fold(
             mark_stage_complete(bucket, asset, fold, is_pooled, mode, "lr")
 
         # ── Random Forest ────────────────────────────────────────────────────
+        # Aggressive memory cleanup before RF — on large folds (fold 4 pooled =
+        # 18.8M rows) prior model objects accumulate enough heap fragmentation
+        # to trigger the OOM killer mid-RF. gc.collect() releases Python objects,
+        # malloc_trim returns fragmented heap pages to the OS.
+        import ctypes
+        gc.collect()
+        try:
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            logger.info("    malloc_trim: heap released to OS")
+        except Exception as e:
+            logger.warning(f"    malloc_trim failed (non-fatal): {e}")
 
         if stage_already_complete(bucket, asset, fold, is_pooled, mode, "rf"):
             logger.info("    RF already complete — loading saved outputs")
