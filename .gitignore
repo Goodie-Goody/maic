@@ -8,3 +8,6 @@ __pycache__/
 .DS_Store
 
 logs/
+gcp-key.json
+stage_cache/
+data_cache/
