@@ -431,7 +431,7 @@ def _make_dataloaders(train_ds, test_ds, batch_size):
         num_workers=NUM_WORKERS,
         pin_memory=True,
         persistent_workers=True,
-        prefetch_factor=4,
+        prefetch_factor=2,  # Reduced from 4 — halves prefetch buffer RAM on large folds
     )
     return (
         DataLoader(train_ds, batch_size=batch_size, shuffle=True,  **kw),
