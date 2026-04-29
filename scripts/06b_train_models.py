@@ -15,7 +15,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
+from cuml.ensemble import RandomForestClassifier  # [OPT] GPU-accelerated RF via cuML — runs on VRAM not RAM, eliminates OOM on large folds
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import (
     classification_report,
@@ -884,6 +884,14 @@ def run_fold(
         except Exception as e:
             logger.warning(f"    malloc_trim failed (non-fatal): {e}")
 
+        # Numpy weighted resampling — computed before if/else so X_train_rf/y_train_rf
+        # are always available for SHAP surrogate regardless of whether RF trains fresh or loads.
+        _rf_probs  = np.array([class_weights[int(c)] for c in y_train])
+        _rf_probs  = _rf_probs / _rf_probs.sum()
+        _rf_idx    = np.random.choice(len(y_train), size=len(y_train), replace=True, p=_rf_probs)
+        X_train_rf = X_train_sc[_rf_idx]
+        y_train_rf = y_train[_rf_idx]
+
         if stage_already_complete(bucket, asset, fold, is_pooled, mode, "rf"):
             logger.info("    RF already complete — loading saved outputs")
             rf_probs, rf_preds, metrics["rf"] = load_stage_outputs(
@@ -894,11 +902,9 @@ def run_fold(
             logger.info("    Training Random Forest")
             rf = RandomForestClassifier(
                 n_estimators=200, max_depth=12,
-                class_weight={i: w for i, w in enumerate(class_weights)},
-                n_jobs=-1, random_state=42,
-                max_samples=0.5  # Halves peak RAM per tree — prevents OOM on fold 4 pooled (18.8M rows)
+                random_state=42,
             )
-            rf.fit(X_train_sc, y_train)
+            rf.fit(X_train_rf, y_train_rf)
             rf_preds = rf.predict(X_test_sc)
             rf_probs = rf.predict_proba(X_test_sc)
             predictions["rf"] = rf_probs
@@ -906,17 +912,34 @@ def run_fold(
                 y_test, rf_preds, target_names=label_names, output_dict=True
             )
 
-            shap_result = compute_shap(rf, X_train_sc, X_test_sc, feat_names, "rf")
-            if shap_result:
-                plot_shap_summary(shap_result[0], shap_result[1], feat_names,
-                                  f"RF SHAP - {tag} {mode}", f"{output_dir}/shap_rf_{mode}.png")
-
             with open(f"{models_dir}/rf_{mode}.pkl", "wb") as f:
-                pickle.dump({"model": rf, "scaler": scaler}, f)
+                pickle.dump({"model": None, "scaler": scaler}, f)
 
             save_stage_outputs(bucket, asset, fold, is_pooled, mode, "rf",
                                rf_probs, rf_preds, metrics["rf"])
             mark_stage_complete(bucket, asset, fold, is_pooled, mode, "rf")
+
+        # RF SHAP — outside if/else so it runs whether RF was fresh or loaded from cache.
+        # cuML RF not supported by TreeExplainer — sklearn surrogate used instead.
+        if not stage_already_complete(bucket, asset, fold, is_pooled, mode, "rf_shap"):
+            try:
+                from sklearn.ensemble import RandomForestClassifier as SklearnRF
+                logger.info("    Computing RF SHAP via sklearn surrogate (50 trees, 50k sample)")
+                _shap_n = min(50000, len(X_train_rf))
+                rf_surrogate = SklearnRF(n_estimators=50, max_depth=8, random_state=42, n_jobs=-1)
+                rf_surrogate.fit(X_train_rf[:_shap_n], y_train_rf[:_shap_n])
+                shap_result = compute_shap(rf_surrogate, X_train_sc[:1000], X_test_sc[:1000], feat_names, "rf")
+                if shap_result:
+                    plot_shap_summary(shap_result[0], shap_result[1], feat_names,
+                                      f"RF SHAP - {tag} {mode}", f"{output_dir}/shap_rf_{mode}.png")
+                    upload_to_gcs(bucket, f"{output_dir}/shap_rf_{mode}.png",
+                                  f"{get_fold_prefix(asset, fold, is_pooled)}shap_rf_{mode}.png")
+                mark_stage_complete(bucket, asset, fold, is_pooled, mode, "rf_shap")
+                logger.info("    RF SHAP surrogate complete")
+            except Exception as e:
+                logger.warning(f"    RF SHAP surrogate failed: {e}")
+        else:
+            logger.info("    RF SHAP already complete — skipping")
 
         # ── XGBoost ──────────────────────────────────────────────────────────
 
