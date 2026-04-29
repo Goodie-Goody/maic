@@ -811,7 +811,8 @@ def run_fold(gcs_client, bucket, asset, fold, train_windows, test_window,
             rf = RandomForestClassifier(
                 n_estimators=200, max_depth=12,
                 class_weight={i: w for i, w in enumerate(class_weights)},
-                n_jobs=-1, random_state=42
+                n_jobs=-1, random_state=42,
+                max_samples=0.5  # Halves peak RAM per tree — prevents OOM on fold 4 pooled (18.8M rows)
             )
             rf.fit(X_train_sc, y_train)
             rf_preds = rf.predict(X_test_sc)
