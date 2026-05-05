@@ -2,6 +2,7 @@ import sys
 import os
 import gc
 import json
+import time
 import logging
 import pickle
 import random
@@ -47,9 +48,7 @@ logger = logging.getLogger(__name__)
 
 torch.set_float32_matmul_precision('high')
 
-# =============================================================================
 # PATHS
-# =============================================================================
 
 # Production uses fractionally differenced features — ablation confirmed they win.
 FEATURES_PREFIX = "v2/features_fracdiff/"
@@ -59,17 +58,13 @@ LABELS_PREFIX   = "v2/labels/"
 # Fracdiff files have a different internal structure so they must be cached separately.
 CACHE_DIR = "/workspace/maic/data_cache_production"
 
-# =============================================================================
 # PRODUCTION PROTOCOL
-# =============================================================================
 
 # 5-seed anti-fluke protocol: proves model stability is not seed-dependent.
 # Results land in seed-specific GCS folders for clean ensemble averaging downstream.
 PRODUCTION_SEEDS = [42, 100, 777, 999, 2026]
 
-# =============================================================================
 # HYPERPARAMETERS — identical to 06b for scientific consistency
-# =============================================================================
 
 SEQ_LENGTH          = 60
 BATCH_SIZE          = 2048
@@ -100,9 +95,7 @@ COMMON_FEATURES = [
 ]
 
 
-# =============================================================================
 # SEED
-# =============================================================================
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -117,12 +110,10 @@ def set_seed(seed=42):
     return rng
 
 
-# =============================================================================
 # RESUMPTION HELPERS
 # results_prefix and stage_cache_dir are passed explicitly — not globals.
 # This prevents seed N's results from leaking into seed N+1's folder if
 # an exception fires mid-seed and the global never gets reset.
-# =============================================================================
 
 def get_fold_prefix(asset, fold, is_pooled, results_prefix):
     if is_pooled:
@@ -138,8 +129,17 @@ def get_stage_local_dir(asset, fold, is_pooled, stage_cache_dir):
 
 
 def fold_already_complete(bucket, asset, fold, is_pooled, results_prefix):
+    # Fold is only complete when ALL model stage markers exist for both modes.
+    # Checking individual markers means partial reruns (e.g. RF/XGB only)
+    # correctly re-enter the fold without touching LR, LSTM or CNN-GAF.
+    models = ["lr", "rf", "rf_shap", "xgb", "lstm", "cnn_gaf"]
+    modes  = ["multiclass", "binary"]
     prefix = get_fold_prefix(asset, fold, is_pooled, results_prefix)
-    return bucket.blob(f"{prefix}metrics_binary.json").exists()
+    return all(
+        bucket.blob(f"{prefix}.done_{mode}_{model}").exists()
+        for mode in modes
+        for model in models
+    )
 
 
 def stage_already_complete(bucket, asset, fold, is_pooled, mode, model_name, results_prefix):
@@ -200,9 +200,7 @@ def load_stage_outputs(bucket, asset, fold, is_pooled, mode, model_name,
     return probs, preds, metrics_dict
 
 
-# =============================================================================
 # GAF
-# =============================================================================
 
 def compute_gasf_pytorch(x):
     x = x.permute(0, 2, 1)
@@ -219,9 +217,7 @@ def compute_gasf_pytorch(x):
     return x_i * x_j - sqrt_i * sqrt_j
 
 
-# =============================================================================
 # DATA LOADING
-# =============================================================================
 
 def parse_window_months(start_ym, end_ym):
     months = []
@@ -298,9 +294,7 @@ def load_window_data(bucket, asset, window_idx, feature_cols=None):
     return df
 
 
-# =============================================================================
 # DATA PREP
-# =============================================================================
 
 def prepare_xy(df, binary=False, purge_end=True):
     if purge_end:
@@ -322,9 +316,7 @@ def get_class_weights(y, n_classes):
     return weights
 
 
-# =============================================================================
 # MODELS
-# =============================================================================
 
 class TimeSeriesDataset(Dataset):
     def __init__(self, X, y, seq_length):
@@ -374,9 +366,7 @@ class CNNGAFClassifier(nn.Module):
         return self.fc2(x)
 
 
-# =============================================================================
 # TRAINING
-# =============================================================================
 
 def _make_dataloaders(train_ds, test_ds, batch_size):
     kw = dict(num_workers=NUM_WORKERS, pin_memory=True,
@@ -555,9 +545,7 @@ def train_cnn_gaf(X_train, y_train, X_test, y_test, class_weights, n_classes, se
     return model, np.array(all_probs), np.array(all_preds), train_losses, val_losses
 
 
-# =============================================================================
 # EXPLAINABILITY
-# =============================================================================
 
 def compute_shap(model_obj, X_train, X_test, feature_names, model_name):
     logger.info(f"    Computing SHAP values for {model_name}")
@@ -602,9 +590,7 @@ def compute_integrated_gradients(model, X_test, y_test, feature_names, n_classes
         return None
 
 
-# =============================================================================
 # PLOTS
-# =============================================================================
 
 def plot_confusion_matrix(y_true, y_pred, labels, title, save_path):
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -670,9 +656,7 @@ def plot_shap_summary(shap_values, X_sample, feature_names, title, save_path):
         logger.warning(f"    SHAP plot failed: {e}")
 
 
-# =============================================================================
 # GCS UPLOAD
-# =============================================================================
 
 def upload_to_gcs(bucket, local_path, gcs_path):
     try:
@@ -682,14 +666,12 @@ def upload_to_gcs(bucket, local_path, gcs_path):
         logger.warning(f"    Upload failed for {gcs_path}: {e}")
 
 
-# =============================================================================
 # FOLD RUNNER
 # results_prefix and stage_cache_dir are explicit parameters — not globals.
-# =============================================================================
 
 def run_fold(gcs_client, bucket, asset, fold, train_windows, test_window,
              feature_cols, results_prefix, stage_cache_dir,
-             is_pooled=False, pooled_assets=None):
+             is_pooled=False, pooled_assets=None, seed=42):
 
     tag = f"{'pooled' if is_pooled else asset} fold {fold}"
 
@@ -818,7 +800,7 @@ def run_fold(gcs_client, bucket, asset, fold, train_windows, test_window,
             logger.info("    Training Random Forest")
             rf = RandomForestClassifier(
                 n_estimators=200, max_depth=12,
-                random_state=42,
+                random_state=seed,
             )
             rf.fit(X_train_rf, y_train_rf)
             rf_preds = rf.predict(X_test_sc)
@@ -841,7 +823,7 @@ def run_fold(gcs_client, bucket, asset, fold, train_windows, test_window,
                 from sklearn.ensemble import RandomForestClassifier as SklearnRF
                 logger.info("    Computing RF SHAP via sklearn surrogate (50 trees, 50k sample)")
                 _shap_n = min(50000, len(X_train_rf))
-                rf_surrogate = SklearnRF(n_estimators=50, max_depth=8, random_state=42, n_jobs=-1)
+                rf_surrogate = SklearnRF(n_estimators=50, max_depth=8, random_state=seed, n_jobs=-1)
                 rf_surrogate.fit(X_train_rf[:_shap_n], y_train_rf[:_shap_n])
                 # Surrogate fidelity check — proves SHAP values reflect the cuML model's
                 # decision boundaries. Agreement rate > 0.90 validates the surrogate.
@@ -878,7 +860,7 @@ def run_fold(gcs_client, bucket, asset, fold, train_windows, test_window,
                 tree_method="hist",
                 device="cuda" if DEVICE.type == "cuda" else "cpu",
                 subsample=0.8, colsample_bytree=0.8,
-                n_jobs=-1, random_state=42,
+                n_jobs=-1, random_state=seed,
                 objective="multi:softprob" if not binary else "binary:logistic",
                 num_class=n_classes if not binary else None,
                 eval_metric="mlogloss" if not binary else "logloss"
@@ -1006,9 +988,7 @@ def run_fold(gcs_client, bucket, asset, fold, train_windows, test_window,
     logger.info(f"  {tag} - complete, results uploaded to gs://{BUCKET}/{prefix}")
 
 
-# =============================================================================
 # MAIN
-# =============================================================================
 
 def main():
     logger.info("Starting 5-Seed Production Run")
@@ -1035,10 +1015,12 @@ def main():
     bucket     = gcs_client.bucket(BUCKET)
     n_folds    = len(WINDOWS) - 1
 
+    pipeline_start = time.time()
+
     for seed in PRODUCTION_SEEDS:
-        logger.info(f"{'=' * 60}")
+        seed_start = time.time()
+
         logger.info(f"SEED: {seed}")
-        logger.info(f"{'=' * 60}")
 
         set_seed(seed)
 
@@ -1062,6 +1044,7 @@ def main():
 
         # Production runs pooled only — asset-specific runs are 06b's domain.
         for fold in range(1, n_folds + 1):
+            fold_start    = time.time()
             train_windows = list(range(0, fold))
             test_window   = fold
             logger.info(f"  [seed={seed}] Fold {fold}/{n_folds}: train={train_windows} test={test_window}")
@@ -1072,15 +1055,20 @@ def main():
                 results_prefix=results_prefix,
                 stage_cache_dir=stage_cache_dir,
                 is_pooled=True,
-                pooled_assets=ASSETS
+                pooled_assets=ASSETS,
+                seed=seed
             )
+            fold_elapsed = time.time() - fold_start
+            logger.info(f"  Fold {fold} done in {fold_elapsed/60:.1f} min")
             gc.collect()
 
-        logger.info(f"  Seed {seed} complete")
+        seed_elapsed = time.time() - seed_start
+        logger.info(f"  Seed {seed} complete in {seed_elapsed/3600:.2f} hrs")
 
-    logger.info("=" * 60)
+    pipeline_elapsed = time.time() - pipeline_start
     logger.info("5-Seed Production Pipeline Complete")
-    logger.info("Results ready for ensemble averaging at gs://{BUCKET}/v2/results_production/")
+    logger.info(f"Total time : {pipeline_elapsed/3600:.2f} hrs")
+    logger.info(f"Results    : gs://{BUCKET}/v2/results_production/")
 
 
 if __name__ == "__main__":

@@ -1,17 +1,38 @@
+# =============================================================================
+# MAIC Project Requirements
+# =============================================================================
+# NOTE: PyTorch and cuML cannot be installed via this file due to custom
+# index URLs. Use setup.sh instead for a full environment setup.
+# This file covers all other dependencies.
+# =============================================================================
+
+# Data
 pyarrow
 polars
+numpy
+
+# GCP
 google-cloud-storage
 google-cloud-bigquery
 python-dotenv
-requests
-psutil
-hmmlearn
+
+# ML
 scikit-learn
+xgboost
 shap
 captum
+hmmlearn
 pyts
+imbalanced-learn
+
+# Statistics
+statsmodels
+scipy
+
+# Plotting
 matplotlib
-xgboost
-torch
-torchvision
-torchaudio
+
+# Utilities
+requests
+psutil
+
