@@ -149,12 +149,18 @@ def main():
             if np.all(series == series[0]):
                 continue
                 
-            _, p_value, _, _, _, _ = adfuller(series)
+            series_clean = series[np.isfinite(series)]
+            if len(series_clean) < 20:
+                logger.warning(f"  [SKIP] {col} — too few valid values after cleaning")
+                continue
+            _, p_value, _, _, _, _ = adfuller(series_clean)
             
             if p_value > P_VALUE_THRESHOLD:
-                d_opt = find_min_d(series)
+                d_opt = find_min_d(series_clean)
                 asset_d_map[col] = d_opt
-                logger.info(f"  [FAIL] {col} (p={p_value:.4f}) -> Assigned d={d_opt}")
+                logger.info(f"  [NON-STATIONARY] {col} (p={p_value:.4f}) — fracdiff required, assigned d={d_opt}")
+            else:
+                logger.info(f"  [STATIONARY] {col} (p={p_value:.4f}) — no transformation needed")
             
         global_d_maps[asset] = asset_d_map
         logger.info(f"  Final Map for {asset}: {asset_d_map if asset_d_map else 'All columns stationary'}")
