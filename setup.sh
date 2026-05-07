@@ -34,11 +34,14 @@ echo "  GPU    : $GPU_NAME"
 echo "  VRAM   : $GPU_MEM"
 echo "  Driver : $DRIVER"
 
-if [[ "$GPU_NAME" != *"Blackwell"* ]] && [[ "$GPU_NAME" != *"RTX PRO 4500"* ]]; then
-    echo "  WARNING: Pipeline optimised for RTX PRO 4500 Blackwell (sm_120)"
-    echo "  Different GPU detected — verify sm_120 support after setup"
+if [[ "$GPU_NAME" == *"Blackwell"* ]] || [[ "$GPU_NAME" == *"RTX PRO 4500"* ]]; then
+    echo "  Blackwell GPU confirmed — nightly cu128 will be used"
+elif [[ "$GPU_NAME" == *"RTX 40"* ]] || [[ "$GPU_NAME" == *"RTX 4"* ]]; then
+    echo "  Ada Lovelace GPU detected — stable cu121 will be used"
+elif [[ "$GPU_NAME" == *"A100"* ]] || [[ "$GPU_NAME" == *"RTX 30"* ]] || [[ "$GPU_NAME" == *"RTX 3"* ]]; then
+    echo "  Ampere GPU detected — stable cu121 will be used"
 else
-    echo "  Blackwell GPU confirmed"
+    echo "  GPU detected — stable cu121 will be used (verify CUDA compatibility if issues arise)"
 fi
 
 # STEP 1 — Validate .env
@@ -159,52 +162,76 @@ echo "[7/8] Installing Python packages..."
 [ ! -f "/workspace/maic/requirements.txt" ] && \
     echo "  ERROR: requirements.txt not found" && exit 1
 
-# PyTorch nightly cu128
-echo "  [7a] Checking PyTorch nightly cu128..."
+# PyTorch — GPU-adaptive install
+# Selects the correct PyTorch build based on detected GPU compute capability:
+#   sm_120 (Blackwell)  → nightly cu128  (required — no stable release yet)
+#   all others          → stable cu121   (broadly compatible: Ampere, Ada, Hopper)
+echo "  [7a] Detecting GPU and selecting PyTorch variant..."
 
-# Step 1 — upgrade nvjitlink first to avoid cuML/PyTorch conflict
+# Upgrade nvjitlink first to avoid cuML conflict regardless of GPU
 # cuML 26.4 requires nvidia-nvjitlink-cu12>=12.9, default install is 12.4
 echo "  Upgrading nvidia-nvjitlink-cu12..."
 pip install --root-user-action=ignore "nvidia-nvjitlink-cu12>=12.9" \
     --break-system-packages --quiet
 echo "  nvjitlink ready"
 
-# Step 2 — check if correct PyTorch nightly is already installed
-# Must be a dev build AND support sm_120 (Blackwell)
+# Detect compute capability via nvidia-smi
+SM_MAJOR=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+    | head -1 | cut -d'.' -f1 | tr -d ' ')
+SM_MINOR=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
+    | head -1 | cut -d'.' -f2 | tr -d ' ')
+SM="${SM_MAJOR}${SM_MINOR}"
+
+echo "  Detected compute capability: sm_${SM}"
+
+if [ "$SM" = "120" ]; then
+    # Blackwell — nightly cu128 required (no stable support yet)
+    PYTORCH_INDEX="https://download.pytorch.org/whl/nightly/cu128"
+    PYTORCH_LABEL="nightly cu128 (Blackwell sm_120)"
+    PYTORCH_CHECK_CMD="'dev' in torch.__version__ and (torch.version.cuda or '').startswith('12.8')"
+else
+    # All other GPUs — stable cu121
+    PYTORCH_INDEX="https://download.pytorch.org/whl/cu121"
+    PYTORCH_LABEL="stable cu121"
+    PYTORCH_CHECK_CMD="'dev' not in torch.__version__ and (torch.version.cuda or '').startswith('12.1')"
+fi
+
+echo "  Selected: PyTorch $PYTORCH_LABEL"
+
+# Check if correct PyTorch already installed
 PYTORCH_OK=0
 python3 -c "
 import torch, sys
 try:
-    is_nightly = 'dev' in torch.__version__
-    cuda_ok    = torch.version.cuda is not None and torch.version.cuda.startswith('12.8')
-    cap        = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0,0)
-    sm_ok      = cap == (12, 0)
-    sys.exit(0 if (is_nightly and cuda_ok and sm_ok) else 1)
+    cap = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0,0)
+    ok  = $PYTORCH_CHECK_CMD
+    sys.exit(0 if ok else 1)
 except Exception:
     sys.exit(1)
 " 2>/dev/null && PYTORCH_OK=1 || PYTORCH_OK=0
 
 if [ "$PYTORCH_OK" -eq 0 ]; then
-    echo "  Installing PyTorch nightly cu128 (force reinstall)..."
+    echo "  Installing PyTorch $PYTORCH_LABEL..."
     pip install --root-user-action=ignore torch torchvision torchaudio \
-        --index-url https://download.pytorch.org/whl/nightly/cu128 \
+        --index-url "$PYTORCH_INDEX" \
         --force-reinstall --break-system-packages --quiet
-    echo "  PyTorch nightly cu128 installed"
-
-    # Verify install succeeded with correct CUDA version
-    python3 -c "
-import torch, sys
-is_nightly = 'dev' in torch.__version__
-cuda_ver   = torch.version.cuda or ''
-cap        = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0,0)
-print(f'  Verified: {torch.__version__} | CUDA {cuda_ver} | sm_{cap[0]}{cap[1]}')
-if not (is_nightly and cuda_ver.startswith('12.8') and cap == (12,0)):
-    print('  ERROR: PyTorch nightly cu128 + sm_120 not confirmed — check manually')
-    sys.exit(1)
-" || { echo "  ERROR: PyTorch verification failed — do not start training"; exit 1; }
+    echo "  PyTorch $PYTORCH_LABEL installed"
 else
-    echo "  PyTorch nightly cu128 already correct — skipping"
+    echo "  PyTorch $PYTORCH_LABEL already correct — skipping"
 fi
+
+# Verify
+python3 - << PYEOF
+import torch, sys
+cuda_ver = torch.version.cuda or 'N/A'
+cap      = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+sm       = f"sm_{cap[0]}{cap[1]}"
+print(f"  Verified: {torch.__version__} | CUDA {cuda_ver} | {sm}")
+if not torch.cuda.is_available():
+    print("  ERROR: CUDA not available after PyTorch install")
+    sys.exit(1)
+PYEOF
+[ $? -ne 0 ] && { echo "  ERROR: PyTorch verification failed — do not start training"; exit 1; }
 
 # Core packages
 echo "  [7b] Installing core packages..."
@@ -264,8 +291,7 @@ if torch.cuda.is_available():
     print(f"  VRAM         : {vram} GB")
     cap = torch.cuda.get_device_capability()
     sm  = f"sm_{cap[0]}{cap[1]}"
-    ok  = " OK" if cap == (12, 0) else " WARNING: expected sm_120"
-    print(f"  Capability   : {sm}{ok}")
+    print(f"  Capability   : {sm}")
 else:
     print("  WARNING: CUDA not available")
 PYEOF
@@ -288,6 +314,10 @@ print('  SHAP         : OK')
 # DONE
 echo ""
 echo ""
+# Make pipeline runner scripts executable
+chmod +x cpu_pipeline.sh gpu_pipeline.sh cpu_post_gpu.sh status.sh 2>/dev/null || true
+echo "  Pipeline scripts marked executable"
+
 echo "Setup complete. Environment ready."
 echo ""
 echo ""

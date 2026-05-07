@@ -331,104 +331,139 @@ def prepare_xy(feat_df, label_series, binary=True):
     return X, y
 
 
+def align_and_concat(frames):
+    """
+    Concatenate a list of DataFrames that may have different column sets.
+    Finds the intersection of columns across all frames and selects only those,
+    preventing ShapeError when fracdiff feature files differ across assets.
+    """
+    # Find common columns in insertion order of the first frame
+    common = set(frames[0].columns)
+    for f in frames[1:]:
+        common &= set(f.columns)
+    common_ordered = [c for c in frames[0].columns if c in common]
+    logger.info(f"  Common columns across all frames: {len(common_ordered)}")
+    return pl.concat([f.select(common_ordered) for f in frames])
+
+
+TRAIN_CHECKPOINT = f"{OUTPUT_DIR}/robustness_train_checkpoint.parquet"
+TEST_CHECKPOINT  = f"{OUTPUT_DIR}/robustness_test_checkpoint.parquet"
+
+
 def run_xgb_robustness(bucket, global_f1w, global_f1s):
     """
     Train XGBoost on fold 3 training data with LOCAL HMM labels,
     evaluate on fold 3 test data with LOCAL labels,
     and compare to the global-label production result.
+
+    Checkpoints train and test DataFrames to disk so the expensive
+    HMM fitting and GCS downloads are skipped on restart.
     """
     logger.info("Running XGBoost robustness evaluation...")
 
-    # --- Build training set with local labels ---
-    train_feat_frames  = []
-    train_label_arrays = []
+    # --- Build or load training set ---
+    if os.path.exists(TRAIN_CHECKPOINT):
+        logger.info(f"  Loading training checkpoint from {TRAIN_CHECKPOINT}")
+        train_df = pl.read_parquet(TRAIN_CHECKPOINT)
+    else:
+        train_feat_frames = []
 
-    for asset_id, asset in enumerate(ASSETS):
-        logger.info(f"  Fitting local HMM for {asset}...")
-        model, scaler, state_map = fit_local_hmm(bucket, asset, TRAIN_WINDOWS)
+        for asset_id, asset in enumerate(ASSETS):
+            logger.info(f"  Fitting local HMM for {asset} (training set)...")
+            model, scaler, state_map = fit_local_hmm(bucket, asset, TRAIN_WINDOWS)
 
-        for w in TRAIN_WINDOWS:
-            feat_df = load_asset_window(
-                bucket, asset, w, FEATURES_FD_PREFIX
-            )
-            if feat_df is None:
-                continue
-            _, local_labels = predict_local_labels(
-                model, scaler, state_map, bucket, asset, w
-            )
-            if local_labels is None:
-                continue
+            for w in TRAIN_WINDOWS:
+                feat_df = load_asset_window(bucket, asset, w, FEATURES_FD_PREFIX)
+                if feat_df is None:
+                    continue
+                _, local_labels = predict_local_labels(
+                    model, scaler, state_map, bucket, asset, w
+                )
+                if local_labels is None:
+                    continue
 
-            feat_df = feat_df.with_columns(pl.lit(asset_id).alias("asset_id"))
+                feat_df = feat_df.with_columns(pl.lit(asset_id).alias("asset_id"))
 
-            # Align labels to fracdiff features by time
-            raw_df = load_asset_window(
-                bucket, asset, w, FEATURES_RAW_PREFIX,
-                columns=["time"] + HMM_FEATURES
-            )
-            label_series = pl.Series("label", local_labels)
-            label_df     = pl.DataFrame({"time": raw_df["time"], "label": label_series})
-            feat_df      = feat_df.join(label_df, on="time", how="inner")
+                # Align local labels to fracdiff time index
+                raw_df       = load_asset_window(
+                    bucket, asset, w, FEATURES_RAW_PREFIX,
+                    columns=["time"] + HMM_FEATURES
+                )
+                label_df     = pl.DataFrame({
+                    "time":  raw_df["time"],
+                    "label": pl.Series(local_labels),
+                })
+                feat_df = feat_df.join(label_df, on="time", how="inner")
+                train_feat_frames.append(feat_df)
 
-            train_feat_frames.append(feat_df)
+            gc.collect()
 
-        gc.collect()
+        if not train_feat_frames:
+            raise RuntimeError("No training data assembled for XGBoost robustness check")
 
-    if not train_feat_frames:
-        raise RuntimeError("No training data assembled for XGBoost robustness check")
+        train_df = align_and_concat(train_feat_frames).sort("time")
+        train_df.write_parquet(TRAIN_CHECKPOINT)
+        logger.info(f"  Training checkpoint saved to {TRAIN_CHECKPOINT}")
 
-    train_df     = pl.concat(train_feat_frames).sort("time")
     feature_cols = [c for c in train_df.columns if c not in ["time", "label", "asset_id"]]
     X_train      = train_df.select(feature_cols).to_numpy().astype(np.float32)
-    y_train_full = train_df["label"].to_numpy().astype(np.int32)
-    y_train_bin  = (y_train_full == 2).astype(np.int32)
-
+    X_train      = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+    y_train_bin  = (train_df["label"].to_numpy() == 2).astype(np.int32)
     logger.info(f"  Training set: {X_train.shape[0]:,} rows, {X_train.shape[1]} features")
 
-    # --- Build test set with both global and local labels ---
-    test_feat_frames   = []
-    test_global_labels = []
-    test_local_labels  = []
+    # --- Build or load test set ---
+    if os.path.exists(TEST_CHECKPOINT):
+        logger.info(f"  Loading test checkpoint from {TEST_CHECKPOINT}")
+        test_df = pl.read_parquet(TEST_CHECKPOINT)
+    else:
+        test_feat_frames = []
 
-    for asset_id, asset in enumerate(ASSETS):
-        feat_df = load_asset_window(bucket, asset, TEST_WINDOW, FEATURES_FD_PREFIX)
-        if feat_df is None:
-            continue
-        feat_df = feat_df.with_columns(pl.lit(asset_id).alias("asset_id"))
+        for asset_id, asset in enumerate(ASSETS):
+            feat_df = load_asset_window(bucket, asset, TEST_WINDOW, FEATURES_FD_PREFIX)
+            if feat_df is None:
+                continue
+            feat_df = feat_df.with_columns(pl.lit(asset_id).alias("asset_id"))
 
-        # Global labels
-        global_label_df = load_global_labels(bucket, asset, TEST_WINDOW)
+            global_label_df = load_global_labels(bucket, asset, TEST_WINDOW)
 
-        # Local labels (refit HMM on training windows for this asset)
-        model, scaler, state_map = fit_local_hmm(bucket, asset, TRAIN_WINDOWS)
-        _, local_lab = predict_local_labels(
-            model, scaler, state_map, bucket, asset, TEST_WINDOW
-        )
-        raw_test_df = load_asset_window(
-            bucket, asset, TEST_WINDOW, FEATURES_RAW_PREFIX,
-            columns=["time"] + HMM_FEATURES
-        )
+            logger.info(f"  Fitting local HMM for {asset} (test labels)...")
+            model, scaler, state_map = fit_local_hmm(bucket, asset, TRAIN_WINDOWS)
+            _, local_lab = predict_local_labels(
+                model, scaler, state_map, bucket, asset, TEST_WINDOW
+            )
+            raw_test_df = load_asset_window(
+                bucket, asset, TEST_WINDOW, FEATURES_RAW_PREFIX,
+                columns=["time"] + HMM_FEATURES
+            )
+            local_label_df = pl.DataFrame({
+                "time":        raw_test_df["time"],
+                "local_label": pl.Series(local_lab),
+            })
 
-        # Align everything to fracdiff feature time index
-        local_label_df = pl.DataFrame({
-            "time":        raw_test_df["time"],
-            "local_label": pl.Series(local_lab),
-        })
+            merged = feat_df \
+                .join(global_label_df.rename({"label": "global_label"}), on="time", how="inner") \
+                .join(local_label_df, on="time", how="inner")
 
-        merged = feat_df \
-            .join(global_label_df.rename({"label": "global_label"}), on="time", how="inner") \
-            .join(local_label_df, on="time", how="inner")
+            test_feat_frames.append(merged)
+            gc.collect()
 
-        test_feat_frames.append(merged)
+        if not test_feat_frames:
+            raise RuntimeError("No test data assembled")
 
-    if not test_feat_frames:
-        raise RuntimeError("No test data assembled")
+        test_df = align_and_concat(test_feat_frames).sort("time")
+        test_df.write_parquet(TEST_CHECKPOINT)
+        logger.info(f"  Test checkpoint saved to {TEST_CHECKPOINT}")
 
-    test_df      = pl.concat(test_feat_frames).sort("time")
+    # Use only the feature cols identified from training data
+    feature_cols = [
+        c for c in feature_cols
+        if c in test_df.columns and c not in ["time", "label", "asset_id",
+                                               "global_label", "local_label"]
+    ]
     X_test       = test_df.select(feature_cols).to_numpy().astype(np.float32)
+    X_test       = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
     y_test_glob  = (test_df["global_label"].to_numpy() == 2).astype(np.int32)
     y_test_local = (test_df["local_label"].to_numpy()  == 2).astype(np.int32)
-
     logger.info(f"  Test set: {X_test.shape[0]:,} rows")
 
     # --- Train XGBoost on local labels ---
@@ -437,7 +472,6 @@ def run_xgb_robustness(bucket, global_f1w, global_f1s):
         clf = xgb.XGBClassifier(**XGB_PARAMS)
         clf.fit(X_train, y_train_bin)
     except Exception:
-        # Fall back to CPU if CUDA unavailable
         logger.warning("  CUDA unavailable, falling back to CPU")
         params_cpu = {**XGB_PARAMS, "tree_method": "hist", "device": "cpu"}
         clf = xgb.XGBClassifier(**params_cpu)
@@ -445,24 +479,23 @@ def run_xgb_robustness(bucket, global_f1w, global_f1s):
 
     y_pred = clf.predict(X_test)
 
-    # --- Metrics ---
-    # Local model evaluated against local labels (apples-to-apples)
+    # Local model vs local test labels (apples-to-apples)
     f1_local_vs_local  = f1_score(y_test_local, y_pred, average="weighted")
     f1s_local_vs_local = f1_score(y_test_local, y_pred, pos_label=1, average="binary")
 
-    # Local model evaluated against global labels (cross-check)
+    # Local model vs global test labels (cross-check)
     f1_local_vs_global  = f1_score(y_test_glob, y_pred, average="weighted")
     f1s_local_vs_global = f1_score(y_test_glob, y_pred, pos_label=1, average="binary")
 
-    logger.info(f"  XGB (local labels) vs local test labels — F1-W: {f1_local_vs_local:.4f}, F1-Stress: {f1s_local_vs_local:.4f}")
-    logger.info(f"  XGB (local labels) vs global test labels — F1-W: {f1_local_vs_global:.4f}, F1-Stress: {f1s_local_vs_global:.4f}")
-    logger.info(f"  XGB (global labels, production) — F1-W: {GLOBAL_XGB_BINARY_F1:.4f}, F1-Stress: {GLOBAL_XGB_STRESS_F1:.4f}")
+    logger.info(f"  XGB (local labels) vs local test  — F1-W: {f1_local_vs_local:.4f}, F1-Stress: {f1s_local_vs_local:.4f}")
+    logger.info(f"  XGB (local labels) vs global test — F1-W: {f1_local_vs_global:.4f}, F1-Stress: {f1s_local_vs_global:.4f}")
+    logger.info(f"  XGB (global, production)          — F1-W: {global_f1w:.4f}, F1-Stress: {global_f1s:.4f}")
 
     return {
-        "f1w_local_vs_local":   round(f1_local_vs_local,   4),
-        "f1s_local_vs_local":   round(f1s_local_vs_local,  4),
-        "f1w_local_vs_global":  round(f1_local_vs_global,  4),
-        "f1s_local_vs_global":  round(f1s_local_vs_global, 4),
+        "f1w_local_vs_local":    round(f1_local_vs_local,   4),
+        "f1s_local_vs_local":    round(f1s_local_vs_local,  4),
+        "f1w_local_vs_global":   round(f1_local_vs_global,  4),
+        "f1s_local_vs_global":   round(f1s_local_vs_global, 4),
         "f1w_global_production": global_f1w,
         "f1s_global_production": global_f1s,
     }
@@ -567,51 +600,43 @@ def main():
     logger.info(f"HMM seeds      : {N_SEEDS}")
     logger.info("=" * 60)
 
-    # --- Step 1: Label comparison ---
-    logger.info("STEP 1: Comparing global vs local HMM labels on test window")
-    comparison_results = []
+    # --- Step 1: Label comparison (skip if already completed) ---
+    AGREEMENT_CSV = f"{OUTPUT_DIR}/hmm_robustness_label_agreement.csv"
 
-    for asset in ASSETS:
-        logger.info(f"Processing {asset}...")
+    if os.path.exists(AGREEMENT_CSV):
+        logger.info(f"STEP 1: Label agreement already computed — loading from {AGREEMENT_CSV}")
+        comparison_results = pl.read_csv(AGREEMENT_CSV).to_dicts()
+        print_label_agreement_table(comparison_results)
+    else:
+        logger.info("STEP 1: Comparing global vs local HMM labels on test window")
+        comparison_results = []
 
-        # Fit local HMM on training windows only
-        model, scaler, state_map = fit_local_hmm(bucket, asset, TRAIN_WINDOWS)
+        for asset in ASSETS:
+            logger.info(f"Processing {asset}...")
+            model, scaler, state_map = fit_local_hmm(bucket, asset, TRAIN_WINDOWS)
+            times, local_labels = predict_local_labels(
+                model, scaler, state_map, bucket, asset, TEST_WINDOW
+            )
+            if local_labels is None:
+                logger.warning(f"  No test data for {asset} in window {TEST_WINDOW}")
+                continue
+            global_df = load_global_labels(bucket, asset, TEST_WINDOW)
+            if global_df is None or global_df.is_empty():
+                logger.warning(f"  No global labels for {asset} in window {TEST_WINDOW}")
+                continue
+            local_df = pl.DataFrame({"time": times, "local": pl.Series(local_labels)})
+            merged   = global_df.join(local_df, on="time", how="inner")
+            result   = compare_labels(
+                merged["label"].to_numpy(),
+                merged["local"].to_numpy(),
+                asset
+            )
+            comparison_results.append(result)
+            gc.collect()
 
-        # Predict local labels on test window
-        times, local_labels = predict_local_labels(
-            model, scaler, state_map, bucket, asset, TEST_WINDOW
-        )
-        if local_labels is None:
-            logger.warning(f"  No test data for {asset} in window {TEST_WINDOW}")
-            continue
-
-        # Load global labels for test window
-        global_df = load_global_labels(bucket, asset, TEST_WINDOW)
-        if global_df is None or global_df.is_empty():
-            logger.warning(f"  No global labels for {asset} in window {TEST_WINDOW}")
-            continue
-
-        # Align by time
-        local_df = pl.DataFrame({
-            "time":  times,
-            "local": pl.Series(local_labels),
-        })
-        merged = global_df.join(local_df, on="time", how="inner")
-
-        result = compare_labels(
-            merged["label"].to_numpy(),
-            merged["local"].to_numpy(),
-            asset
-        )
-        comparison_results.append(result)
-        gc.collect()
-
-    print_label_agreement_table(comparison_results)
-
-    # Save label comparison
-    comp_df = pl.DataFrame(comparison_results)
-    comp_df.write_csv(f"{OUTPUT_DIR}/hmm_robustness_label_agreement.csv")
-    logger.info(f"Label agreement saved to {OUTPUT_DIR}/hmm_robustness_label_agreement.csv")
+        print_label_agreement_table(comparison_results)
+        pl.DataFrame(comparison_results).write_csv(AGREEMENT_CSV)
+        logger.info(f"Label agreement saved to {AGREEMENT_CSV}")
 
     # --- Step 2: XGBoost performance comparison ---
     logger.info("\nSTEP 2: XGBoost performance comparison (local vs global labels)")
