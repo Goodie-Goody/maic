@@ -125,6 +125,13 @@ FEAT_CLEAN = {
 gcs_client = storage.Client()
 gcs_bucket = gcs_client.bucket(BUCKET)
 
+# --- Skip logic ---
+_DONE_MARKER = "v2/pipeline_markers/08_generate_paper_figures.done"
+if gcs_bucket.blob(_DONE_MARKER).exists():
+    logger.info("08_generate_paper_figures — already complete, skipping")
+    logger.info(f"  To rerun: gsutil rm gs://{BUCKET}/{_DONE_MARKER}")
+    sys.exit(0)
+
 
 def gcs_download(gcs_path, local_path, quiet=False):
     os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
@@ -538,6 +545,11 @@ def generate_summary_figures():
         log.warning(f"  Summary figures failed: {e}")
 
 
+def _write_done_marker():
+    _marker = "v2/pipeline_markers/08_generate_paper_figures.done"
+    gcs_bucket.blob(_marker).upload_from_string(b"")
+    log.info(f"Done marker written: gs://{BUCKET}/{_marker}")
+
 if __name__ == "__main__":
     log.info("MAIC Paper Figure Generator")
     log.info(f"Output root: {BASE_DIR}")
@@ -554,3 +566,5 @@ if __name__ == "__main__":
     for name, d in DIRS.items():
         files = [f for f in os.listdir(d) if f.endswith(".png")]
         log.info(f"  {name}/  {len(files)} figures")
+
+    _write_done_marker()

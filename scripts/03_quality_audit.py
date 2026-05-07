@@ -273,6 +273,13 @@ def main():
     bq_client = bigquery.Client(project=PROJECT_ID)
     bucket = gcs_client.bucket(BUCKET)
 
+    # --- Skip logic ---
+    _marker = "v2/pipeline_markers/03_quality_audit.done"
+    if bucket.blob(_marker).exists():
+        logger.info("03_quality_audit — already complete, skipping")
+        logger.info(f"  To rerun: gsutil rm gs://{BUCKET}/{_marker}")
+        return
+
     logger.info("Starting comprehensive quality audit")
     logger.info(f"Bucket   : {BUCKET}")
     logger.info(f"Prefix   : {OUTPUT_PREFIX}")
@@ -332,6 +339,10 @@ def main():
         exit(1)
 
     logger.info("Dataset passed all quality checks")
+
+    # --- Write done marker ---
+    bucket.blob(_marker).upload_from_string(b"")
+    logger.info(f"Done marker written: gs://{BUCKET}/{_marker}")
 
 if __name__ == "__main__":
     main()

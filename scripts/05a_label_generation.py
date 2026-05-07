@@ -243,6 +243,14 @@ def save_labels(gcs_client, bucket, asset, df, states):
 
 
 def main():
+    # --- Skip logic ---
+    _client = storage.Client()
+    _bucket = _client.bucket(BUCKET)
+    _marker = "v2/pipeline_markers/05a_label_generation.done"
+    if _bucket.blob(_marker).exists():
+        logger.info("05a_label_generation — already complete, skipping")
+        logger.info(f"  To rerun: gsutil rm gs://{BUCKET}/{_marker}")
+        return
     gcs_client = storage.Client()
     bucket = gcs_client.bucket(BUCKET)
 
@@ -281,6 +289,16 @@ def main():
     logger.info("ETHUSDT labeled successfully")
 
 
+def _write_done_marker():
+    from google.cloud import storage as _storage
+    from config import BUCKET as _BUCKET
+    _client = _storage.Client()
+    _marker = "v2/pipeline_markers/05a_label_generation.done"
+    _client.bucket(_BUCKET).blob(_marker).upload_from_string(b"")
+    import logging as _logging
+    _logging.getLogger(__name__).info(f"Done marker written: gs://{_BUCKET}/{_marker}")
+
 if __name__ == "__main__":
     main()
+    _write_done_marker()
 

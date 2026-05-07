@@ -20,6 +20,21 @@ FEATURES_PREFIX = "v2/features/"
 
 
 def main():
+    # --- Skip logic ---
+    import os as _os
+    _os.environ.setdefault(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "/workspace/maic/gcp-key.json"
+    )
+    from google.cloud import storage as _storage
+    _client = _storage.Client()
+    _bucket = _client.bucket(BUCKET)
+    _marker = "v2/pipeline_markers/05b_verify_features.done"
+    if _bucket.blob(_marker).exists():
+        logger.info("05b_verify_features — already complete, skipping")
+        logger.info(f"  To rerun: gsutil rm gs://{BUCKET}/{_marker}")
+        return
+
     gcs = fs.GcsFileSystem()
 
     base_path = f"{BUCKET}/{FEATURES_PREFIX}"
@@ -92,6 +107,10 @@ def main():
         sys.exit(1)
 
     logger.info("Audit PASSED: All schemas consistent")
+
+    # --- Write done marker ---
+    _bucket.blob(_marker).upload_from_string(b"")
+    logger.info(f"Done marker written: gs://{BUCKET}/{_marker}")
 
 
 if __name__ == "__main__":

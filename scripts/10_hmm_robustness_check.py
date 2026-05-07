@@ -590,6 +590,13 @@ def main():
     client = storage.Client()
     bucket = client.bucket(BUCKET)
 
+    # --- Skip logic ---
+    _marker = "v2/pipeline_markers/10_hmm_robustness_check.done"
+    if bucket.blob(_marker).exists():
+        logger.info("10_hmm_robustness_check — already complete, skipping")
+        logger.info(f"  To rerun: gsutil rm gs://{BUCKET}/{_marker}")
+        return
+
     logger.info("=" * 60)
     logger.info("HMM ROBUSTNESS CHECK")
     logger.info(f"Probe fold     : {PROBE_FOLD}")
@@ -648,6 +655,10 @@ def main():
     xgb_df = pl.DataFrame([xgb_results])
     xgb_df.write_csv(f"{OUTPUT_DIR}/hmm_robustness_xgb_comparison.csv")
     logger.info(f"XGBoost comparison saved to {OUTPUT_DIR}/hmm_robustness_xgb_comparison.csv")
+
+    # --- Write done marker ---
+    bucket.blob(_marker).upload_from_string(b"")
+    logger.info(f"Done marker written: gs://{BUCKET}/{_marker}")
 
     print(f"\n  Output files:")
     print(f"    {OUTPUT_DIR}/hmm_robustness_label_agreement.csv")
