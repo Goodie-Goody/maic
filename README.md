@@ -1,7 +1,7 @@
 # MAIC — Near Real-Time Liquidity Stress Detection in Cryptocurrency Markets
 
 ![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20RunPod-lightgrey.svg)
 ![GPU](https://img.shields.io/badge/GPU-CUDA%2012.8-green.svg)
 
@@ -304,4 +304,4 @@ WorldQuant University for educational support. The open-source community behind 
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+Apache 2.0 — see [LICENSE](LICENSE) for details.
