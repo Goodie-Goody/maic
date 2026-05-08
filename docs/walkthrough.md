@@ -1,89 +1,52 @@
-# MAIC Data Pipeline — Walkthrough
+# MAIC Pipeline — Walkthrough
 
 ## Overview
 
-This walkthrough documents the full data engineering and machine learning pipeline for the paper "Real-time Liquidity Stress Detection in Cryptocurrency Markets Using Trade Flow Analysis and Machine Learning". It covers everything from GCP account setup to trained models in GCS, written so that anyone can replicate the pipeline from scratch.
+This walkthrough documents the full infrastructure and execution path for the paper *Near Real-Time Liquidity Stress Detection in Cryptocurrency Markets Using Trade Flow Analysis and Machine Learning*. It covers everything from GCP account setup to trained models, paper figures, and analysis outputs.
 
-> **Important:** Cloud Shell is used only for provisioning infrastructure (creating buckets, datasets, and VMs). All data processing and training scripts must be run on a Compute Engine VM, not in Cloud Shell. Cloud Shell lacks the memory and persistent storage required for multi-gigabyte tick data files and model training.
+**Python version:** 3.11+ required. Python 3.11 is recommended — all scripts were developed and validated on 3.11. Python 3.12 may have cuML compatibility issues.
+
+**Compute model:** Data preparation and analysis run on CPU (any machine). Model training requires a CUDA-capable GPU. The pipeline was built and validated on RunPod using an NVIDIA RTX PRO 4500 Blackwell GPU (34GB VRAM).
+
+> **GCS is the single source of truth.** All data, features, labels, models, and results live in your GCS bucket. Compute instances are ephemeral — spin them up, run scripts, spin them down. Everything that matters persists in the cloud.
 
 ---
 
-## Step 0 — GCP Account & Infrastructure Setup
+## Step 0 — GCP Account and Infrastructure Setup
 
-Create a GCP account at [console.cloud.google.com](https://console.cloud.google.com). Enable billing by linking a payment method. Once billing is active, open Cloud Shell by clicking the terminal icon in the top right. Cloud Shell is your orchestration terminal — it has `gcloud` and `bq` pre-installed.
-
-Set your project and create your storage and database backend:
+Create a GCP account at [console.cloud.google.com](https://console.cloud.google.com). Enable billing. Open Cloud Shell and provision your storage and database backend:
 
 ```bash
 gcloud config set project your-project-id
 
-# Create the GCS bucket in us-central1
+# Storage bucket — same region as your compute to avoid egress costs
 gsutil mb -l us-central1 gs://your-bucket-name
 
-# Create the BigQuery dataset
+# BigQuery dataset for the quality audit
 bq mk --dataset --location=us-central1 your-project-id:your-dataset-name
-
-# Enable the Compute Engine API
-gcloud services enable compute.googleapis.com
 ```
+
+Create a service account with Storage read/write permissions and download its key as `gcp-key.json`. This file must never be committed to git — it is covered by `.gitignore`.
 
 ---
 
-## Step 1 — GitHub Repository
+## Step 1 — Repository Setup
 
-Create a public repository on [github.com](https://github.com). Initialize it with a README. Then clone it into Cloud Shell:
-
-```bash
-cd ~
-git clone https://github.com/your-username/your-repo.git
-cd your-repo
-```
-
-Configure git identity:
+Clone the repo and configure your environment:
 
 ```bash
-git config --global user.email "your-email"
-git config --global user.name "Your Name"
+git clone https://github.com/Goodie-Goody/maic.git
+cd maic
+
+# Create your .env from the template
+cp .env.example .env
+# Fill in: GCP_PROJECT_ID, GCP_BUCKET, GCP_REGION, BQ_DATASET, BQ_TABLE
+
+# Add your service account key
+cp /path/to/your-key.json gcp-key.json
 ```
 
-GitHub requires a Personal Access Token for pushing via the command line. Generate one at GitHub — Settings — Developer Settings — Personal Access Tokens — Tokens Classic — with `repo` scope.
-
-Configure git to securely cache your token in memory for 10 hours:
-
-```bash
-git config --global credential.helper 'cache --timeout=36000'
-```
-
-On your first `git push` you will be prompted for your username and token once.
-
----
-
-## Step 2 — Folder Structure
-
-```bash
-mkdir -p scripts docs logs
-
-touch config.py
-touch requirements.txt
-touch run.sh
-touch .env.example
-touch scripts/01_download.py
-touch scripts/02_csv_to_parquet.py
-touch scripts/03_quality_audit.py
-touch scripts/04_feature_engineering.py
-touch scripts/05_label_generation.py
-touch scripts/06_train_models.py
-touch scripts/verify_features.py
-touch docs/walkthrough.md
-```
-
-The scripts are numbered to make the execution order explicit. Each script is self-contained, reads from `config.py`, logs to `logs/`, and exits with a clear success or failure message.
-
----
-
-## Step 3 — Environment and Configuration
-
-Create `.env` locally — this file is never pushed to GitHub:
+Your `.env` file should look like:
 
 ```bash
 GCP_PROJECT_ID=your-project-id
@@ -93,116 +56,57 @@ BQ_DATASET=your-bigquery-dataset
 BQ_TABLE=your-external-table
 ```
 
-Create `.gitignore`:
+---
 
-```
-.env
-__pycache__/
-*.pyc
-*.log
-.venv/
-*.parquet
-*.csv
-*.pkl
-.DS_Store
-logs/
-```
+## Step 2 — Environment Setup
 
-The `logs/` directory is excluded from git because it contains large pkl model files and log outputs. These are backed up to GCS instead (see Step 9).
-
-Create `.env.example` which is pushed to GitHub so replicators know what variables are needed:
+Run `setup.sh` once per machine. It installs all dependencies and automatically selects the correct PyTorch build for your GPU:
 
 ```bash
-GCP_PROJECT_ID=your-project-id-here
-GCP_BUCKET=your-bucket-name-here
-GCP_REGION=us-central1
-BQ_DATASET=your-bigquery-dataset-name
-BQ_TABLE=your-external-table-name
+bash setup.sh
 ```
 
-`config.py` loads from `.env` and defines all pipeline constants in one place:
+What `setup.sh` does:
+- Installs all packages from `requirements.txt`
+- Detects GPU compute capability via `nvidia-smi`
+- Installs **PyTorch nightly cu128** for Blackwell (sm_120) GPUs
+- Installs **PyTorch stable cu121** for all other GPUs (Ampere, Ada Lovelace, Hopper)
+- Installs cuML for GPU-accelerated Random Forest
+- Makes `cpu_pipeline.sh`, `gpu_pipeline.sh`, `cpu_post_gpu.sh`, and `status.sh` executable
+- Configures git credentials
 
-```python
-import os
-from dotenv import load_dotenv
+After setup, validate that everything is in order before running any computation:
 
-load_dotenv()
-
-PROJECT_ID = os.getenv("GCP_PROJECT_ID")
-BUCKET = os.getenv("GCP_BUCKET")
-REGION = os.getenv("GCP_REGION", "us-central1")
-BQ_DATASET = os.getenv("BQ_DATASET")
-BQ_TABLE = os.getenv("BQ_TABLE")
-
-ASSETS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-
-WINDOWS = [
-    ("2020-02", "2020-07"),
-    ("2020-11", "2021-05"),
-    ("2021-11", "2022-05"),
-    ("2022-11", "2023-04"),
-    ("2024-07", "2024-12"),
-]
-
-GCS_PREFIX = "v2/trades_parquet_flat/"
-PARQUET_COMPRESSION = "snappy"
-
-SCHEMA = {
-    "id": "int64",
-    "price": "float64",
-    "qty": "float64",
-    "quote_qty": "float64",
-    "time": "timestamp[us, tz=UTC]",
-    "is_buyer_maker": "bool",
-    "is_best_match": "bool",
-}
-```
-
-`requirements.txt`:
-
-```
-pyarrow
-pandas
-polars
-google-cloud-storage
-google-cloud-bigquery
-tqdm
-python-dotenv
-requests
-psutil
-hmmlearn
-scikit-learn
-shap
-captum
-pyts
-matplotlib
-xgboost
-torch
-torchvision
-torchaudio
+```bash
+bash cpu_pipeline.sh --check   # env, imports, GCS bucket
+bash gpu_pipeline.sh --check   # GPU, CUDA, cuML, XGBoost GPU, GCS bucket
 ```
 
 ---
 
-## Step 4 — Sampling Window Design
+## Step 3 — Sampling Window Design
 
-The dataset covers five deliberate six-month windows rather than a continuous time series. This design choice serves two purposes: it captures distinct market regimes with different liquidity characteristics, and it manages class imbalance by ensuring stress and non-stress periods are represented in roughly comparable proportions across the dataset.
+The dataset covers five deliberate six-month windows rather than a continuous time series. This design serves two purposes: it captures distinct market regimes with different liquidity characteristics, and it ensures stress and non-stress periods are represented in comparable proportions.
 
-| Window | Period | Market Context | Key Stress Events |
-|--------|--------|---------------|-------------------|
-| 1 | Feb 2020 — Jul 2020 | COVID crash and recovery | COVID crash (March 12-13 2020) |
-| 2 | Nov 2020 — May 2021 | Bull run and China/Musk crash | May 2021 crash (May 19 2021) |
-| 3 | Nov 2021 — May 2022 | Peak bull market and Terra-Luna | Terra-Luna collapse (May 9-12 2022) |
-| 4 | Nov 2022 — Apr 2023 | Post-FTX recovery | FTX collapse (November 8-11 2022) |
-| 5 | Jul 2024 — Dec 2024 | Post-halving cycle | — |
+| Window | Period | Market Context | Key Event |
+|--------|--------|---------------|-----------|
+| 0 | Feb 2020 – Jul 2020 | COVID crash and recovery | COVID crash (Mar 12 2020) |
+| 1 | Nov 2020 – May 2021 | Bull run | May 2021 crash (May 19 2021) |
+| 2 | Nov 2021 – May 2022 | Peak bull market and contagion | Terra-Luna collapse (May 9 2022) |
+| 3 | Nov 2022 – Apr 2023 | Post-FTX recovery | FTX bankruptcy (Nov 8 2022) |
+| 4 | Jul 2024 – Dec 2024 | Post-halving cycle | — |
 
-> **Note on window boundaries:** Windows 2 and 3 were originally designed to end in April, but this was corrected to include May after discovering that two major stress events (May 2021 crash and Terra-Luna collapse) fell outside the original boundaries by a single month. The `validate_against_events` function in Script 5 caught this during label validation.
+> **Note on window 0 and the COVID event:** Window 0 is always training data across all folds. No out-of-sample predictions exist for March 2020, so the COVID-19 crash is excluded from the lead-time analysis.
+
+> **Note on SOLUSDT:** Data collection begins November 2020 to align with the asset's Binance listing date. SOLUSDT has no data in Window 0.
+
+> **Note on window boundaries:** Windows 1 and 2 were originally designed to end in April, but corrected to include May after two major stress events (May 2021 crash and Terra-Luna) fell outside the original boundaries by a single month.
 
 ---
 
-## Step 5 — BigQuery External Table
+## Step 4 — BigQuery External Table
 
-Before running the quality audit, create the BigQuery external table pointing at the production parquet files. Run this in Cloud Shell:
+Before running the quality audit, create the BigQuery external table pointing at the production parquet files. Run this in Cloud Shell once:
 
 ```bash
 bq query --use_legacy_sql=false --project_id=your-project-id '
@@ -214,452 +118,164 @@ OPTIONS (
 '
 ```
 
-This only needs to be run once, and again whenever the output prefix changes or new files are added to the existing prefix. After this BigQuery can query all parquet files in the production prefix as a single logical table using the `_FILE_NAME` pseudocolumn for file-level filtering.
-
 ---
 
-## Step 6 — First Commit and Push
+## Step 5 — Running the Pipeline
+
+The pipeline is split across three bash scripts that enforce correct execution order. Each script uses local `.done` markers and GCS pipeline markers to skip completed stages safely.
+
+### Option A — Foreground (recommended for first run / validation)
+
+Watch output live. Terminal must stay open:
 
 ```bash
-git add .
-git commit -m "add project config, requirements, and environment setup"
-git push
+bash cpu_pipeline.sh      # stages 01–05b
+bash gpu_pipeline.sh      # stages 06a–06d
+bash cpu_post_gpu.sh      # stages 07a–10
 ```
 
----
+### Option B — Background with nohup (recommended for long training runs)
 
-## Step 7 — Pipeline VM Setup (CPU)
-
-The first five scripts run on a CPU-only VM. GPU is not required until the training script (Script 6).
-
-Create the VM from Cloud Shell:
+Survives terminal disconnects:
 
 ```bash
-gcloud compute instances create pipeline-vm \
-  --zone=us-central1-a \
-  --machine-type=e2-highcpu-8 \
-  --image-family=debian-12 \
-  --image-project=debian-cloud \
-  --scopes=storage-full \
-  --boot-disk-size=50GB
+nohup bash cpu_pipeline.sh  >> logs/cpu_pipeline.log  2>&1 &
+# wait for completion, then:
+nohup bash gpu_pipeline.sh  >> logs/gpu_pipeline.log  2>&1 &
+# wait for completion, then:
+nohup bash cpu_post_gpu.sh  >> logs/cpu_post_gpu.log  2>&1 &
 ```
 
-`e2-highcpu-8` provides 8 vCPUs and 8GB RAM. The `--scopes=storage-full` flag grants the VM read/write access to all GCS buckets in the project. Running in `us-central1-a` — the same region as the bucket — means all transfers use Google's internal network with no egress costs. Cost is approximately $0.19/hour.
-
-SSH in from Cloud Shell:
+Monitor progress any time:
 
 ```bash
-gcloud compute ssh pipeline-vm --zone=us-central1-a
+bash status.sh
+tail -f logs/gpu_pipeline.log
 ```
 
-On the VM, install dependencies and clone the repo:
+### Pipeline Flags
+
+All scripts support:
 
 ```bash
-sudo apt-get update && sudo apt-get install -y python3-pip python3-venv git
-git clone https://github.com/your-username/your-repo.git
-cd your-repo
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Authenticate Python GCS access:
-
-```bash
-gcloud auth application-default login
-```
-
-Create the `.env` file on the VM:
-
-```bash
-nano .env
-```
-
-Add swap space to prevent silent OOM failures on large files:
-
-```bash
-sudo fallocate -l 8G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-free -h
+--check      # validate environment only, no computation
+--dry-run    # print execution plan, run nothing
+--from=N     # resume from stage N
+--only=X     # GPU pipeline only: run a single stage (e.g. --only=06d)
 ```
 
 ---
 
-## Step 8 — Running the Data Pipeline
+## Step 6 — What Each Script Does
 
-Each script runs in the background using `nohup` so it survives terminal disconnects.
+### 01 — Download
 
-### Script 1 — Download
+Downloads monthly trade archives for each asset and window from [Binance Vision](https://data.binance.vision). SHA256 checksum verification inline. For months where the monthly archive is incomplete, falls back to daily files automatically. Full resume capability — files already in GCS above the minimum size threshold are skipped.
 
-[`scripts/01_download.py`](../scripts/01_download.py)
+### 02 — CSV to Parquet
 
-Downloads monthly trade archives for each asset and window from [Binance Vision](https://data.binance.vision). SHA256 checksum verification happens inline during download. For months where the monthly archive is missing days, the script automatically falls back to downloading individual daily files. Full resume capability — files already present in GCS above the minimum size threshold are skipped.
+Converts raw CSV zip files to Parquet using PyArrow's C++ streaming reader. Schema applied explicitly — no type inference, `time` always written as UTC microsecond timestamp. Two known Binance data anomalies handled automatically:
+- **BTCUSDT March 2023** — monthly archive only contains days 1-12; remaining 19 daily files stitched using timestamp filtering
+- **Duplicate CSV files in zip archives** — detected and deduplicated with a warning
 
-Raw zips land in:
-- `raw/zips/monthly/` — complete monthly archives
-- `raw/zips/daily/` — daily patches for incomplete months
+### 03 — Quality Audit
 
-```bash
-mkdir -p logs
-nohup python3 scripts/01_download.py > logs/01_download.log 2>&1 &
-echo "PID: $!"
-tail -f logs/01_download.log
-```
+Three-layer audit:
+1. File inventory — every expected parquet exists and exceeds minimum size
+2. Schema check — column names and types consistent across all files
+3. BigQuery audit — null IDs, bad prices, extreme outliers, duplicate trade IDs, low-count days
 
-### Script 2 — Convert CSV to Parquet
+Produces a JSON report at `logs/quality_audit_report.json`. Exits with code 1 if any issues found.
 
-[`scripts/02_csv_to_parquet.py`](../scripts/02_csv_to_parquet.py)
+Expected result: `status: PASSED, quality_score: 100.0`
 
-Reads raw CSV zip files from GCS and converts them to parquet using PyArrow's C++ streaming CSV reader. Schema is applied explicitly — no type inference, every column cast correctly, `time` column always written as UTC microsecond timestamp.
+### 04a — Feature Engineering
 
-**Two known source data anomalies handled automatically:**
+Computes seven microstructure features at three temporal scales (10s, 60s, 300s) using Polars lazy evaluation with streaming execution. Cross-asset contagion features (OFI correlation, lead-lag) computed using BTC as market leader for ETH and SOL, and ETH as an additional lead for SOL. Output: `v2/features/`, one parquet per asset per month.
 
-1. **BTCUSDT March 2023** — the Binance monthly archive only contains days 1-12. The script detects this and stitches the remaining 19 daily files using timestamp filtering.
+### 04b — Stationarity and Fractional Differencing
 
-2. **Duplicate CSV files in zip archives** — Binance occasionally packages the same CSV file under two different paths within a single zip (observed for May 2021 across all three assets). The script detects this condition, takes only the first CSV, and logs a warning.
+Runs Augmented Dickey-Fuller tests on all features at 5% significance. All seven microstructure features are natively stationary — they measure rates, ratios, and local dynamics rather than price levels. Only the raw price series is non-stationary. Applies fractional differencing with asset-specific minimum differencing orders (BTC: d=0.3, ETH: d=0.4, SOL: d=0.2) to preserve maximum memory content while achieving stationarity. Output: `v2/features_fracdiff/`.
 
-```bash
-nohup python3 scripts/02_csv_to_parquet.py > logs/02_csv_to_parquet.log 2>&1 &
-echo "PID: $!"
-tail -f logs/02_csv_to_parquet.log
-```
+### 05a — Label Generation
 
-### Script 3 — Quality Audit
+Fits a 3-state Gaussian HMM per asset on four features: RV_300s, OFI_300s, Kyle_lambda_300s, intensity_300s. StandardScaler applied before fitting. Diagonal covariance. Five seeds evaluated, best log-likelihood retained. States mapped by RV mean rank: 0=calm, 1=elevated, 2=stress. Labels validated against four known crisis events. Model pickles saved to `logs/` and backed up to GCS. Output: `v2/labels/`, one parquet per asset per month.
 
-[`scripts/03_quality_audit.py`](../scripts/03_quality_audit.py)
+### 05b — Feature Verification
 
-Runs a three-layer audit against the converted parquet files:
+Reads only parquet metadata footers via byte-range requests. Verifies row counts, column counts, and schema consistency across all feature files. Fast — no data movement.
 
-1. **File inventory** — checks every expected parquet file exists and is above the minimum size threshold
-2. **Schema check** — reads parquet metadata for every file and verifies column names and types
-3. **BigQuery audit** — runs SQL queries checking null IDs, bad prices, extreme outliers above $10M, bad quantities, duplicate trade IDs, and days with suspiciously low trade counts
+### 06a–06d — Model Training
 
-Produces a structured JSON report saved to `logs/quality_audit_report.json`. Exits with code 1 if any issues are found.
+Four training scripts of increasing scope:
 
-Before running, ensure the BigQuery external table is refreshed:
+| Script | Scope | Output Path |
+|--------|-------|-------------|
+| 06a | Baseline: asset-specific, folds 1-4 | `v2/results/` |
+| 06b | Extended: asset-specific + pooled | `v2/results/` |
+| 06c | Ablation: fracdiff vs raw price | `v2/results_ablation/` |
+| 06d | Production: 5 seeds × 4 folds × pooled | `v2/results_production/` |
 
-```bash
-bq query --use_legacy_sql=false --project_id=your-project-id '
-CREATE OR REPLACE EXTERNAL TABLE `your-project-id.your-dataset.your-table`
-OPTIONS (
-  format = "PARQUET",
-  uris = ["gs://your-bucket/v2/trades_parquet_flat/*.parquet"]
-)
-'
-```
+06d is the primary production run. It uses a purged expanding walk-forward scheme with a 30-minute embargo between training and test windows, GPU-accelerated cuML Random Forest and XGBoost, BF16 mixed precision for LSTM, and writes GCS stage markers after every completed fold-model combination for fine-grained resumption.
 
-Then run the audit:
+Estimated runtime on RTX PRO 4500 Blackwell: 06d takes 6–10 hours for 5 seeds × 4 folds.
 
-```bash
-nohup python3 scripts/03_quality_audit.py > logs/03_quality_audit.log 2>&1 &
-echo "PID: $!"
-tail -f logs/03_quality_audit.log
-cat logs/quality_audit_report.json
-```
+### 07a–07c — Aggregation
 
-Expected result:
+Reads results from GCS and assembles `production_results.csv` and `production_results.parquet` — the single source of truth for all reported metrics. 07c is the most important: it produces the production results used in the paper and loaded dynamically by scripts 08 and 10.
 
-```
-status: PASSED
-quality_score: 100.0
-BTCUSDT: 971 days, 2,570,682,192 trades, 0 duplicates
-ETHUSDT: 971 days, 1,191,086,501 trades, 0 duplicates
-SOLUSDT: 789 days,   516,787,062 trades, 0 duplicates
-```
+### 08 — Paper Figure Generation
 
-### Script 4 — Feature Engineering
+Generates all five publication figures locally and uploads to `v2/paper_figures/` in GCS:
+- Fig 1: SHAP XGBoost multiclass feature attribution
+- Fig 2: Fold progression learning curves
+- Fig 3: SHAP Random Forest binary (surrogate-based)
+- Fig 4: LSTM Integrated Gradients
+- Fig 5: ROC curves across all five architectures
 
-[`scripts/04_feature_engineering.py`](../scripts/04_feature_engineering.py)
+### 09 — Lead-Time Analysis
 
-Computes multi-scale microstructure features from raw tick data using a Polars lazy evaluation pipeline with streaming execution. Raw trades are aggregated into 10-second windows using dynamic grouping and upsampled to produce a strictly regular time series.
+Evaluates the framework's operational utility across three crisis events using genuine out-of-sample predictions. Each event is evaluated against the fold whose test window contains it (fold 1 for May 2021, fold 2 for Terra-Luna, fold 3 for FTX). Warning declared at first run of ≥ 2 consecutive 300-second bars with P(stress) > 0.85.
 
-Features are computed at three temporal scales — 10 seconds, 60 seconds, and 300 seconds:
+Results: Terra-Luna 108.3 min, FTX 176.0 min, May 2021 ≥ 240 min (lower bound — signal present throughout the 4-hour search window, reflecting the event's gradual character).
 
-| Feature Group | Features | Scales |
-|---------------|----------|--------|
-| Trade Flow Imbalance | OFI, TCI | 10s, 60s, 300s |
-| Trade Intensity | intensity | 10s, 60s, 300s |
-| Price Impact | ILLIQ, Kyle_lambda | 10s, 60s, 300s |
-| Volatility | RV, VWAP, VWAP_dev | 10s, 60s, 300s |
-| Inter-trade Duration | CV_dt | 10s |
-| Cross-asset Contagion | OFI_corr, Lead_Lag | 60s, 300s |
+### 10 — HMM Robustness Check
 
-Cross-asset contagion features are computed using BTC as the market leader for ETH and SOL, and ETH as an additional lead asset for SOL. This reflects the documented price discovery hierarchy in cryptocurrency markets.
-
-Output lands in `v2/features/` as one parquet file per asset per month.
-
-```bash
-nohup python3 scripts/04_feature_engineering.py > logs/04_feature_engineering.log 2>&1 &
-echo "PID: $!"
-tail -f logs/04_feature_engineering.log
-```
-
-### Verify Feature Dataset
-
-[`scripts/verify_features.py`](../scripts/verify_features.py)
-
-Reads only the parquet metadata footer of each feature file via PyArrow byte-range requests. Verifies row counts, column counts, and schema consistency across all files.
-
-```bash
-python3 scripts/verify_features.py
-```
-
-### Script 5 — Label Generation
-
-[`scripts/05_label_generation.py`](../scripts/05_label_generation.py)
-
-Fits a 3-state Gaussian Hidden Markov Model per asset on four core microstructure features — RV_300s, OFI_300s, Kyle_lambda_300s, and intensity_300s. The HMM identifies latent market regimes unsupervised. States are then labeled by sorting on mean realized volatility: 0 (calm), 1 (elevated), 2 (stress).
-
-**Key design decisions:**
-
-- **StandardScaler** is applied before fitting. The HMM features operate on vastly different scales (OFI bounded in [-1, 1], intensity potentially in hundreds). Without scaling the HMM's covariance estimation would be dominated by high-magnitude features and ignore Order Flow Imbalance entirely.
-
-- **Diagonal covariance** (`covariance_type="diag"`) is used instead of full covariance. Full covariance would require approximately 20 minutes per asset versus 9 minutes for diagonal, and the practical difference in regime detection quality is minimal for this dataset.
-
-- **Multi-seed initialization**. The EM algorithm is sensitive to starting conditions and can get stuck in local minima. The script runs 5 seeds (0 through 4) independently and keeps the model with the highest log likelihood. This is necessary because `hmmlearn` does not support `n_init` in its API.
-
-- **Validation against known events**. After fitting, the labels are validated against four known stress events: COVID crash, May 2021 crash, Terra-Luna collapse, and FTX collapse. The unsupervised model consistently identifies 80-99% of observations within these event windows as State 2 (stress), providing strong evidence that the states are economically meaningful.
-
-- **Model persistence**. Each fitted model is saved to `logs/{ASSET}_hmm_model.pkl` along with its scaler and state mapping. This enables future inference on new data without recomputing the global distribution.
-
-```bash
-nohup python3 scripts/05_label_generation.py > logs/05_label_generation.log 2>&1 &
-echo "PID: $!"
-tail -f logs/05_label_generation.log
-```
-
-Expected result:
-
-| Asset | Calm | Elevated | Stress |
-|-------|------|----------|--------|
-| BTCUSDT | 49.4% | 26.3% | 24.3% |
-| ETHUSDT | 50.7% | 25.3% | 24.0% |
-| SOLUSDT | 39.2% | 40.1% | 20.7% |
-
-Validation against known events:
-
-| Event | BTC | ETH | SOL |
-|-------|-----|-----|-----|
-| COVID crash | 86.9% | 88.8% | n/a |
-| May 2021 crash | 97.6% | 99.8% | 99.9% |
-| Terra-Luna | 47.7% | 69.7% | 71.0% |
-| FTX collapse | 81.9% | 69.5% | 95.0% |
+Compares globally-fitted HMM labels against locally-fitted HMM labels for Fold 3. Trains a fresh HMM on Windows 0–2 only per asset, applies it to the test window, and compares label agreement. Then trains XGBoost on locally-labelled data and evaluates against both local and global test labels. The cross-evaluation (local model vs global labels) yielding F1-Stress of 0.4802 confirms that local refitting introduces its own calibration bias — global fitting is the methodologically superior choice.
 
 ---
 
-## Step 9 — Backup Before VM Shutdown
+## Step 7 — Skip/Resume Logic
 
-Before spinning down the pipeline VM, back up all logs and pkl files to GCS:
+Every script in the pipeline checks for a GCS completion marker before doing any work:
+
+```
+gs://<bucket>/v2/pipeline_markers/<script_name>.done
+```
+
+If the marker exists, the script logs a skip message and exits immediately — no computation, no risk of overwriting results. The marker is written only on successful completion.
+
+To force any script to rerun:
+
+```bash
+gsutil rm gs://your-bucket/v2/pipeline_markers/05a_label_generation.done
+```
+
+The bash pipeline runners additionally use local `.done` files in `logs/` for stage-level skip logic. Both levels work together: the GCS marker prevents redundant computation even if local markers are absent (e.g. on a fresh compute instance).
+
+---
+
+## Step 8 — Before Shutting Down a Compute Instance
+
+Back up HMM model pickles and logs to GCS before terminating any instance:
 
 ```bash
 BACKUP="v2/vm_backup_$(date +%Y%m%d_%H%M)/"
-
-gsutil -m cp -r ~/maic/logs/ gs://your-bucket/${BACKUP}logs/
-gsutil -m cp -r ~/maic/scripts/ gs://your-bucket/${BACKUP}scripts/
-gsutil cp ~/maic/config.py gs://your-bucket/${BACKUP}
-gsutil cp ~/maic/requirements.txt gs://your-bucket/${BACKUP}
-gsutil cp ~/maic/.env.example gs://your-bucket/${BACKUP}
-
-gsutil ls gs://your-bucket/${BACKUP}
+gsutil -m cp logs/*.pkl gs://your-bucket/${BACKUP}logs/
+gsutil -m cp -r logs/ gs://your-bucket/${BACKUP}logs/
 ```
 
-Do not back up `.env` — it contains credentials.
-
-Stop (not delete) the pipeline VM to preserve its disk state for potential future use:
-
-```bash
-exit
-gcloud compute instances stop pipeline-vm --zone=us-central1-a
-```
-
-Stopped VMs incur only disk storage cost (~$2/month for 50GB).
-
----
-
-## Step 10 — GPU VM Setup (for Script 6)
-
-Script 6 requires a GPU for LSTM and CNN-GAF training. There are three paths depending on your GCP account status.
-
-### Path A — GCP GPU VM (if quota is available)
-
-New GCP accounts often have zero GPU quota. Check:
-
-```bash
-gcloud compute project-info describe --project=your-project-id \
-  | grep -i "NVIDIA\|GPU"
-```
-
-If quota is 0, request an increase via the Quotas page in the console. If the system shows "enter a value between 0 and 0" you are not eligible for self-service quota increase and must contact Google Cloud Sales.
-
-If quota is approved, find the current deep learning VM image family (these get deprecated periodically):
-
-```bash
-gcloud compute images list \
-  --project=deeplearning-platform-release \
-  --filter="family~pytorch" \
-  --format="table(family, creationTimestamp)" \
-  --sort-by="~creationTimestamp" \
-  | head -n 10
-```
-
-Create the GPU VM using the most recent image family:
-
-```bash
-gcloud compute instances create gpu-vm \
-  --zone=us-central1-a \
-  --machine-type=n1-standard-8 \
-  --accelerator=type=nvidia-tesla-t4,count=1 \
-  --image-family=pytorch-2-9-cu129-ubuntu-2204-nvidia-580 \
-  --image-project=deeplearning-platform-release \
-  --scopes=storage-full \
-  --boot-disk-size=100GB \
-  --maintenance-policy=TERMINATE
-```
-
-If zone reports `ZONE_RESOURCE_POOL_EXHAUSTED`, try a loop across zones:
-
-```bash
-for zone in us-central1-b us-east1-c europe-west4-a us-west1-b; do
-  echo "Trying $zone..."
-  gcloud compute instances create gpu-vm \
-    --zone=$zone \
-    --machine-type=n1-standard-8 \
-    --accelerator=type=nvidia-tesla-t4,count=1 \
-    --image-family=pytorch-2-9-cu129-ubuntu-2204-nvidia-580 \
-    --image-project=deeplearning-platform-release \
-    --scopes=storage-full \
-    --boot-disk-size=100GB \
-    --maintenance-policy=TERMINATE \
-    && echo "SUCCESS in $zone" && break
-done
-```
-
-SSH in and set up:
-
-```bash
-gcloud compute ssh gpu-vm --zone=us-central1-a
-
-# Verify GPU
-nvidia-smi
-
-# Clone repo and install
-git clone https://github.com/your-username/your-repo.git
-cd your-repo
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-nano .env
-gcloud auth application-default login
-
-# Verify CUDA
-python3 -c "import torch; print(torch.cuda.is_available())"
-```
-
-### Path B — Google Colab Pro (recommended fallback)
-
-If GCP GPU quota is unavailable, Colab Pro provides immediate T4/V100/A100 access for £9.99/month. Sign up at [colab.research.google.com/signup](https://colab.research.google.com/signup).
-
-Create a new notebook. Runtime → Change runtime type → T4 GPU → High-RAM.
-
-Run one cell to verify GPU:
-
-```python
-import torch
-print(torch.cuda.is_available())
-print(torch.cuda.get_device_name(0))
-```
-
-Open the terminal at the bottom left of the Colab screen and proceed exactly as you would on a VM:
-
-```bash
-git clone https://github.com/your-username/your-repo.git
-cd your-repo
-gcloud auth application-default login
-gcloud config set project your-project-id
-
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-nano .env
-python3 -c "import torch; print(torch.cuda.is_available())"
-```
-
-Colab Pro sessions last up to 24 hours which is sufficient for the full training run.
-
-### Path C — Third-party GPU providers
-
-Vast.ai, Lambda Labs, Paperspace, and RunPod all offer GPU instances with SSH access. GCS access requires `gcloud auth application-default login` which adds some friction but works.
-
----
-
-## Step 11 — Running the Training Script
-
-### Script 6 — Train Models
-
-[`scripts/06_train_models.py`](../scripts/06_train_models.py)
-
-Trains five models per asset per fold using purged walk-forward cross-validation:
-
-| Model | Library | Interpretability Method |
-|-------|---------|------------------------|
-| Logistic Regression | scikit-learn | SHAP LinearExplainer |
-| Random Forest | scikit-learn | SHAP TreeExplainer |
-| XGBoost | xgboost (GPU) | SHAP TreeExplainer |
-| LSTM | PyTorch | Integrated Gradients (Captum) |
-| CNN-GAF | PyTorch + pyts | Gradient Saliency |
-
-**Key design decisions:**
-
-- **Walk-forward cross-validation** — train on windows 0 to n-1, test on window n. With 5 windows this produces 4 folds.
-
-- **Purging** — the last 30 rows of each training window are dropped to prevent leakage from the 300-second lookback features overlapping into the test set.
-
-- **Three-class primary, binary secondary** — each fold trains both a three-class classifier (calm, elevated, stress) and a binary classifier (stress vs not-stress). The three-class results show methodological completeness; the binary results show practical utility for real-time alerts.
-
-- **Asset-specific and pooled models** — each asset gets its own model set. Additionally, a pooled model trained on all three assets tests the Sirignano and Cont universal price formation hypothesis. The pooled model uses only the 26 features common across all assets plus an asset indicator column.
-
-- **Class weights** — computed dynamically per fold to handle class imbalance. Passed to all models as `class_weight="balanced"` equivalent.
-
-- **XGBoost on GPU** — uses `tree_method="hist"` with `device="cuda"` when available.
-
-- **LSTM architecture** — 2-layer LSTM with 128 hidden units, dropout 0.2, gradient clipping at 1.0, learning rate scheduler reducing on plateau.
-
-- **CNN-GAF architecture** — 2 conv layers (32, 64 channels) with max pooling, 2 fully connected layers (128, n_classes) with dropout 0.3. Uses only the 4 core HMM features to keep image computation tractable.
-
-- **Output structure** — per fold per mode (binary/multiclass): predictions parquet, metrics JSON, confusion matrices PNG, ROC curves PNG, loss curves PNG, SHAP summary plots PNG, saved models (pkl for sklearn/xgb, pt for PyTorch). All uploaded to `gs://your-bucket/v2/results/{asset}/fold_{n}/` after each fold completes.
-
-Run:
-
-```bash
-nohup python3 scripts/06_train_models.py > logs/06_train_models.log 2>&1 &
-echo "PID: $!"
-tail -f logs/06_train_models.log
-```
-
-Estimated runtime on T4: 6-8 hours for all assets all folds all modes.
-
----
-
-## Step 12 — Post-Training Cleanup
-
-Once training completes and results are confirmed in GCS, immediately delete the GPU VM to stop billing:
-
-```bash
-exit
-gcloud compute instances delete gpu-vm --zone=your-zone --quiet
-gcloud compute instances list
-```
-
-Back up all training logs and outputs:
-
-```bash
-BACKUP="v2/vm_backup_$(date +%Y%m%d_%H%M)_training/"
-gsutil -m cp -r ~/maic/logs/ gs://your-bucket/${BACKUP}
-```
+Do not back up `gcp-key.json` or `.env` — they contain credentials.
 
 ---
 
@@ -667,55 +283,42 @@ gsutil -m cp -r ~/maic/logs/ gs://your-bucket/${BACKUP}
 
 | Path | Contents |
 |------|----------|
-| `raw/zips/monthly/` | Raw zip archives from Binance Vision, monthly granularity |
-| `raw/zips/daily/` | Raw zip archives for gap patches, daily granularity |
-| `v2/trades_parquet_flat/` | Production parquet files, one per asset per month |
-| `v2/features/` | Feature parquet files, one per asset per month, 10s windows |
-| `v2/labels/` | Label parquet files, one per asset per month, 3-state regimes |
-| `v2/results/` | Training outputs — predictions, metrics, plots, models |
-| `v2/vm_backup_YYYYMMDD_HHMM/` | Dated VM state backups — logs, scripts, pkl files |
+| `raw/zips/monthly/` | Raw Binance zip archives, monthly granularity |
+| `raw/zips/daily/` | Daily patches for incomplete months |
+| `v2/trades_parquet_flat/` | Converted trade data, one parquet per asset per month |
+| `v2/features/` | Raw microstructure features |
+| `v2/features_fracdiff/` | Fractionally differenced features (model input) |
+| `v2/labels/` | HMM regime labels (0=calm, 1=elevated, 2=stress) |
+| `v2/results/` | Baseline and extended training outputs |
+| `v2/results_ablation/` | Ablation study outputs |
+| `v2/results_production/` | Production run — 5 seeds × 4 folds × all models |
+| `v2/paper_figures/` | Publication figures |
+| `v2/pipeline_markers/` | Script completion markers |
+| `v2/vm_backup_YYYYMMDD_HHMM/` | Dated backups |
 
 ---
 
 ## Dataset Summary
 
-| Asset | Days Present | Total Trades | Duplicates | Start | End |
-|-------|-------------|--------------|------------|-------|-----|
-| BTCUSDT | 971 | 2,570,682,192 | 0 | 2020-02-01 | 2024-12-31 |
-| ETHUSDT | 971 | 1,191,086,501 | 0 | 2020-02-01 | 2024-12-31 |
-| SOLUSDT | 789 | 516,787,062 | 0 | 2020-11-01 | 2024-12-31 |
-| **Total** | | **4,278,555,755** | **0** | | |
+| Asset | Total Trades | Start | Columns |
+|-------|-------------|-------|---------|
+| BTCUSDT | 2,570,682,192 | Feb 2020 | 28 |
+| ETHUSDT | 1,191,086,501 | Feb 2020 | 31 (+3 BTC cross-asset) |
+| SOLUSDT | 516,787,062 | Nov 2020 | 34 (+6 cross-asset) |
+| **Total** | **4,278,555,755** | | |
 
-> SOL starts November 2020 — this is expected, not a data gap. SOL was listed on Binance in November 2020.
-
----
-
-## Feature Dataset Summary
-
-| Asset | Files | Rows | Columns |
-|-------|-------|------|---------|
-| BTCUSDT | 30 | 8,389,440 | 28 |
-| ETHUSDT | 30 | 8,389,440 | 31 |
-| SOLUSDT | 24 | 6,816,952 | 34 |
-| **Total** | **90** | **23,595,832** | — |
-
-BTCUSDT has 28 columns — 26 single-asset features plus `time` and `price`. ETHUSDT has 3 additional BTC cross-asset contagion features. SOLUSDT has 6 additional cross-asset features — 3 from BTC and 3 from ETH.
+Feature files: 90 parquet files, 23,595,832 total rows across 5 windows × 3 assets.
 
 ---
 
 ## Notes for Replicators
 
-- Copy `.env.example` to `.env` and fill in your own GCP details before running anything
-- The VM must be in the same region as your GCS bucket for internal network transfers
-- `gcloud auth application-default login` is required on every VM before running any Python script that accesses GCS
-- Add swap space before running the conversion script
-- All scripts are idempotent — safe to re-run if interrupted, already completed files are skipped
-- Scripts 1 through 5 run on a CPU VM. Script 6 requires GPU (or CPU with long runtime)
-- The `validate_against_events` function in Script 5 is critical — it caught the Windows 2/3 boundary error that would have silently excluded two major stress events
-- Binance occasionally packages duplicate CSV files inside monthly zips. Script 2 handles this generically
-- Deep learning VM image families get deprecated periodically — use the `gcloud compute images list` command in Step 10 to find the current family name
-- If GCP GPU quota is unavailable, Colab Pro at £9.99/month is the fastest fallback path
+- **Python 3.11 is required.** cuML, PyTorch nightly, and polars are sensitive to Python version. Do not use 3.12 without testing cuML compatibility first.
+- All scripts are idempotent — safe to rerun if interrupted. Already completed files are skipped at both the item level (inside each script) and the script level (GCS pipeline markers).
+- `gcloud auth application-default login` is not required when using a service account key via `GOOGLE_APPLICATION_CREDENTIALS`. `setup.sh` sets this environment variable automatically.
+- Fold 4 training (18.8M rows) requires at least 20GB GPU VRAM. The production run was validated on a 34GB Blackwell GPU. Lower VRAM machines may need reduced batch sizes.
+- The `v2/vm_backup_20260420_1709/` prefix in GCS contains the original HMM model pickles from the initial pipeline run, used to validate that the re-run HMM converged to an identical solution.
 
 ---
 
-*Last updated: April 22, 2026*
+*Last updated: May 2026*

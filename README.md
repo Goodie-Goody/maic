@@ -1,5 +1,10 @@
 # MAIC — Near Real-Time Liquidity Stress Detection in Cryptocurrency Markets
 
+![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20RunPod-lightgrey.svg)
+![GPU](https://img.shields.io/badge/GPU-CUDA%2012.8-green.svg)
+
 > **Paper:** *Near Real-Time Liquidity Stress Detection in Cryptocurrency Markets Using Trade Flow Analysis and Machine Learning*
 > Goodness Kalu, Uchenna Ejike, Joseph Edet, Emmanuel Fagbuyi, Godfrey Kunde, and Hannah Igboke
 > WorldQuant University · Preprint submitted May 2026
@@ -150,6 +155,7 @@ XGBoost achieves binary weighted F1 of **0.9706** with a seed range of only 0.00
 
 ### Requirements
 
+- **Python 3.11+** (3.11 recommended — tested and validated throughout; 3.12 may have cuML compatibility issues)
 - A GCP project with a Cloud Storage bucket
 - A GCP service account key with Storage read/write permissions, saved as `gcp-key.json` in the repo root
 - A `.env` file (copy from `.env.example`) with your project and bucket details
@@ -293,3 +299,9 @@ For detailed infrastructure setup including BigQuery external tables, VM provisi
 ## Acknowledgements
 
 WorldQuant University for educational support. The open-source community behind the scientific Python ecosystem. GPU computing provided via RunPod cloud services on an NVIDIA RTX PRO 4500 Blackwell GPU.
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE) for details.
