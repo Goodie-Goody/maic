@@ -40,7 +40,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 # GCP credentials: bridges the gap between gcloud CLI auth and the Python
 # google-cloud-storage library, which looks for ADC not the CLI session.
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/workspace/maic/gcp-key.json"
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gcp-key.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,12 +58,12 @@ RESULTS_PREFIX  = "v2/results_run1/"
 
 # [OPT] GCS cache: persistent volume — eliminates redundant downloads across folds.
 # With expanding windows, fold 4 would otherwise re-download everything from folds 1-3.
-CACHE_DIR = "/workspace/maic/data_cache"
+CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_cache")
 
 # Stage cache: persistent volume for model-level resume state.
 # Stores probs + preds + metrics per model per mode per fold.
 # Survives pod restarts — unlike /tmp which is ephemeral.
-STAGE_CACHE_DIR = "/workspace/maic/stage_cache"
+STAGE_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "stage_cache")
 
 SEQ_LENGTH       = 60
 BATCH_SIZE       = 2048

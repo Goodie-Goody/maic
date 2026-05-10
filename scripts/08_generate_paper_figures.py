@@ -31,7 +31,7 @@ from sklearn.metrics import roc_curve, auc
 from google.cloud import storage
 import logging
 
-sys.path.insert(0, "/workspace/maic")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ""))
 from config import ASSETS, BUCKET, WINDOWS
 
 logging.basicConfig(
@@ -41,7 +41,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-BASE_DIR = "/workspace/maic/paper_figures"
+BASE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "paper_figures")
 DIRS = {
     "baseline":   os.path.join(BASE_DIR, "baseline"),
     "ablation":   os.path.join(BASE_DIR, "ablation"),
@@ -55,10 +55,10 @@ SEED         = 42
 PROD_PREFIX  = f"v2/results_production/seed_{SEED}/pooled/fold_4/"
 FEAT_PREFIX  = "v2/features_fracdiff/"
 LABEL_PREFIX = "v2/labels/"
-DATA_CACHE   = "/workspace/maic/data_cache_production"
-PROD_CSV     = "/workspace/maic/production_results.csv"
-ABL_CSV      = "/workspace/maic/ablation_results.csv"
-BASE_CSV     = "/workspace/maic/baseline_results.csv"
+DATA_CACHE   = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_cache_production")
+PROD_CSV     = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "production_results.csv")
+ABL_CSV      = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "ablation_results.csv")
+BASE_CSV     = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "baseline_results.csv")
 GCS_PREFIX   = "v2/paper_figures"
 
 plt.rcParams.update({

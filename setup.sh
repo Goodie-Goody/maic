@@ -1,24 +1,26 @@
 #!/bin/bash
-# MAIC Environment Setup (GPU-Adaptive)
-# Usage: bash /workspace/maic/setup.sh
+# MAIC Environment Setup (Fully Portable: RunPod & Local)
+# Usage: bash setup.sh
 #
-# Requires on persistent volume (/workspace/maic/) — all gitignored:
+# Requires in the repository root directory (gitignored):
 #   - gcp-key.json    GCP service account key
 #   - .env            All environment variables including GitHub token
-#
-# Required .env keys:
-#   GCP_PROJECT_ID, GCP_BUCKET, GCP_REGION, BQ_DATASET, BQ_TABLE,
-#   GOOGLE_APPLICATION_CREDENTIALS, GITHUB_TOKEN, GITHUB_USER, GITHUB_EMAIL
 
 set -e
 
+# Dynamically determine the repository root based on where this script lives
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$REPO_ROOT"
+
 echo ""
+echo "========================================================"
 echo "MAIC Environment Setup"
+echo "Repository Root: $REPO_ROOT"
+echo "========================================================"
 echo ""
 
 # GPU PRE-CHECK (Adaptive)
-echo ""
-echo "Hardware detection..."
+echo "[0/8] Hardware detection..."
 
 HAS_GPU=0
 if ! command -v nvidia-smi &> /dev/null; then
@@ -50,7 +52,7 @@ fi
 echo ""
 echo "[1/8] Validating .env..."
 
-ENV_FILE="/workspace/maic/.env"
+ENV_FILE="$REPO_ROOT/.env"
 
 if [ ! -f "$ENV_FILE" ]; then
     echo "  ERROR: .env not found at $ENV_FILE"
@@ -58,6 +60,11 @@ if [ ! -f "$ENV_FILE" ]; then
 fi
 
 set -a; source "$ENV_FILE"; set +a
+
+# Ensure credentials path is absolute if it was set relatively in .env
+if [[ "$GOOGLE_APPLICATION_CREDENTIALS" != /* ]]; then
+    export GOOGLE_APPLICATION_CREDENTIALS="$REPO_ROOT/$GOOGLE_APPLICATION_CREDENTIALS"
+fi
 
 REQUIRED_KEYS=(
     GCP_PROJECT_ID GCP_BUCKET GCP_REGION BQ_DATASET BQ_TABLE
@@ -79,21 +86,27 @@ echo "  .env loaded and validated"
 echo ""
 echo "[2/8] Installing system packages..."
 
-apt-get update -qq 2>/dev/null || true
+# Setup sudo command if running locally as non-root
+SUDO_CMD=""
+if [ "$(id -u)" -ne 0 ] && command -v sudo &> /dev/null; then
+    SUDO_CMD="sudo"
+fi
 
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+$SUDO_CMD apt-get update -qq 2>/dev/null || true
+
+DEBIAN_FRONTEND=noninteractive $SUDO_CMD apt-get install -y -qq \
     apt-utils curl wget git build-essential ca-certificates gnupg \
     lsb-release unzip htop tmux net-tools vim nano \
     -o Dpkg::Use-Pty=0 > /dev/null 2>&1 || true
 true
 
-echo "  System packages installed"
+echo "  System packages installed/verified"
 
 # STEP 3 — Python and pip
 echo ""
 echo "[3/8] Verifying Python and pip..."
 
-command -v python3 &>/dev/null || apt-get install -y -qq python3 python3-pip > /dev/null
+command -v python3 &>/dev/null || $SUDO_CMD apt-get install -y -qq python3 python3-pip > /dev/null
 echo "  Found: $(python3 --version)"
 pip install --root-user-action=ignore --upgrade pip --break-system-packages --quiet
 echo "  pip ready"
@@ -102,22 +115,49 @@ echo "  pip ready"
 echo ""
 echo "[4/8] Authenticating to GCP..."
 
+# 1. Check if it's already working
 if ! command -v gcloud &> /dev/null; then
-    echo "  Installing gcloud CLI..."
-    curl -sSL https://sdk.cloud.google.com > /tmp/install_gcloud.sh
-    bash /tmp/install_gcloud.sh --disable-prompts --install-dir=/usr/local/lib/gcloud > /dev/null 2>&1
-    ln -sf /usr/local/lib/gcloud/google-cloud-sdk/bin/gcloud /usr/local/bin/gcloud
-    ln -sf /usr/local/lib/gcloud/google-cloud-sdk/bin/gsutil /usr/local/bin/gsutil
-    echo "  gcloud installed"
+    echo "  gcloud not in PATH. Checking default installation directory..."
+    
+    # 2. If it's installed but not in PATH, fix the PATH for this session
+    if [ -d "$HOME/google-cloud-sdk" ]; then
+        echo "  Found SDK directory at $HOME/google-cloud-sdk. Repairing PATH..."
+        export PATH="$PATH:$HOME/google-cloud-sdk/bin"
+    else
+        # 3. If it's actually missing, install it
+        echo "  SDK not found on disk. Installing gcloud CLI..."
+        curl -sSL https://sdk.cloud.google.com > /tmp/install_gcloud.sh
+        # CLOUDSDK_PYTHON=python3 ensures it works on modern distros without a 'python' alias
+        CLOUDSDK_PYTHON=python3 bash /tmp/install_gcloud.sh --disable-prompts --install-dir="$HOME" > /dev/null 2>&1 || {
+            echo "  ERROR: gcloud installation failed."
+            exit 1
+        }
+        export PATH="$PATH:$HOME/google-cloud-sdk/bin"
+    fi
 else
-    echo "  gcloud already installed"
+    echo "  gcloud already installed and active"
 fi
 
-gcloud auth activate-service-account     --key-file="$GOOGLE_APPLICATION_CREDENTIALS" --quiet 2>/dev/null
-gcloud config set project "$GCP_PROJECT_ID" --quiet 2>/dev/null
-export GOOGLE_APPLICATION_CREDENTIALS="$GOOGLE_APPLICATION_CREDENTIALS"
+# 4. Permanent PATH injection (Safe for re-runs)
+# For Bash users
+if [ -f "$HOME/.bashrc" ] && ! grep -q "google-cloud-sdk" "$HOME/.bashrc"; then
+    echo 'export PATH="$PATH:$HOME/google-cloud-sdk/bin"' >> "$HOME/.bashrc"
+    echo "  Added SDK to .bashrc"
+fi
 
-echo "  Authenticated: $(gcloud auth list --format='value(account)' 2>/dev/null | head -1)"
+# For Fish users (like you)
+if [ -d "$HOME/.config/fish" ] && ! grep -q "google-cloud-sdk" "$HOME/.config/fish/config.fish" 2>/dev/null; then
+    echo "source $HOME/google-cloud-sdk/path.fish.inc" >> "$HOME/.config/fish/config.fish"
+    echo "  Added SDK to Fish config"
+fi
+
+# 5. Final verification & Auth
+# Explicitly use the full path just in case the export didn't propagate to the sub-shell
+GCLOUD_BIN="$HOME/google-cloud-sdk/bin/gcloud"
+$GCLOUD_BIN auth activate-service-account --key-file="$GOOGLE_APPLICATION_CREDENTIALS" --quiet 2>/dev/null
+$GCLOUD_BIN config set project "$GCP_PROJECT_ID" --quiet 2>/dev/null
+
+echo "  Authenticated: $($GCLOUD_BIN auth list --format='value(account)' 2>/dev/null | head -1)"
 
 # STEP 5 — GitHub Authentication
 echo ""
@@ -140,25 +180,25 @@ echo "  GitHub auth configured for $GITHUB_USER"
 echo ""
 echo "[6/8] Syncing MAIC repo..."
 
-if [ ! -d "/workspace/maic/.git" ]; then
-    echo "  Cloning..."
+if [ ! -d "$REPO_ROOT/.git" ]; then
+    echo "  WARNING: Directory is not a git repo. Initializing..."
     git clone "https://github.com/${GITHUB_USER}/maic.git" /tmp/maic_clone
-    cp -r /tmp/maic_clone/. /workspace/maic/
+    cp -r /tmp/maic_clone/. "$REPO_ROOT/"
     rm -rf /tmp/maic_clone
-    echo "  Cloned"
+    echo "  Repo synced"
 else
     echo "  Pulling latest..."
-    cd /workspace/maic && git pull --quiet
+    cd "$REPO_ROOT" && git pull --quiet
     echo "  Up to date"
 fi
 
-cd /workspace/maic
+cd "$REPO_ROOT"
 
 # STEP 7 — Python packages
 echo ""
 echo "[7/8] Installing Python packages..."
 
-[ ! -f "/workspace/maic/requirements.txt" ] && \
+[ ! -f "$REPO_ROOT/requirements.txt" ] && \
     echo "  ERROR: requirements.txt not found" && exit 1
 
 if [ "$HAS_GPU" -eq 1 ]; then
@@ -189,7 +229,7 @@ pip install --root-user-action=ignore torch torchvision torchaudio \
     --force-reinstall --break-system-packages --quiet
 
 echo "  [7b] Installing core packages..."
-pip install --root-user-action=ignore -r /workspace/maic/requirements.txt \
+pip install --root-user-action=ignore -r "$REPO_ROOT/requirements.txt" \
     --break-system-packages --quiet
 
 if [ "$HAS_GPU" -eq 1 ]; then
@@ -210,11 +250,11 @@ echo "  All packages ready"
 echo ""
 echo "[8/8] Finalising environment..."
 
-mkdir -p /workspace/maic/logs
+mkdir -p "$REPO_ROOT/logs"
 
 # Download existing HMM models if available
 for asset in BTCUSDT ETHUSDT SOLUSDT; do
-    LOCAL_PATH="/workspace/maic/logs/${asset}_hmm_model.pkl"
+    LOCAL_PATH="$REPO_ROOT/logs/${asset}_hmm_model.pkl"
     if [ ! -f "$LOCAL_PATH" ]; then
         gsutil cp \
             "gs://${GCP_BUCKET}/v2/vm_backup_20260420_1709/logs/logs/${asset}_hmm_model.pkl" \
@@ -246,7 +286,7 @@ print(f'  NumPy        : {numpy.__version__}')
 # DONE
 echo ""
 echo ""
-chmod +x cpu_pipeline.sh gpu_pipeline.sh cpu_post_gpu.sh status.sh 2>/dev/null || true
+chmod +x "$REPO_ROOT"/*.sh "$REPO_ROOT"/scripts/*.sh 2>/dev/null || true
 echo "  Pipeline scripts marked executable"
 
 echo "========================================================"
@@ -254,10 +294,10 @@ echo "Setup complete. Environment ready."
 echo "========================================================"
 echo ""
 if [ "$HAS_GPU" -eq 0 ]; then
-    echo "  CPU DETECTED: You can run data prep and analysis scripts."
+    echo "  CPU DETECTED: You can run data prep and analysis scripts locally."
     echo "  Run: bash cpu_pipeline.sh"
     echo ""
-    echo "  NOTE: You will need to spin up a GPU instance (e.g., RunPod)"
+    echo "  NOTE: You will need to switch to a GPU instance (e.g., RunPod)"
     echo "  to execute the 'gpu_pipeline.sh' training scripts."
 else
     echo "  GPU DETECTED: You can run the full pipeline."

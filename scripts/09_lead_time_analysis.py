@@ -13,7 +13,7 @@ from google.cloud import storage
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import ASSETS, BUCKET, WINDOWS
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/workspace/maic/gcp-key.json"
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gcp-key.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,8 +83,8 @@ RESULTS_PREFIX = f"v2/results_production/seed_{BEST_SEED}/"
 LABELS_PREFIX  = "v2/labels/"
 
 # Output paths
-OUTPUT_CSV     = "/workspace/maic/lead_time_results.csv"
-OUTPUT_PARQUET = "/workspace/maic/lead_time_results.parquet"
+OUTPUT_CSV     = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lead_time_results.csv")
+OUTPUT_PARQUET = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lead_time_results.parquet")
 
 
 # =============================================================================

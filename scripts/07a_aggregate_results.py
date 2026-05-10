@@ -11,7 +11,7 @@ from google.cloud import storage
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import ASSETS, BUCKET
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/workspace/maic/gcp-key.json"
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gcp-key.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -265,7 +265,7 @@ def main():
         return
 
     # Save full results table locally for further analysis
-    output_path = "/workspace/maic/baseline_results.parquet"
+    output_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "baseline_results.parquet")
     df.write_parquet(output_path)
     logger.info(f"Full results saved to {output_path}")
 
@@ -276,7 +276,7 @@ def main():
     print_best_models(df)
 
     # Also save a CSV for easy reading
-    csv_path = "/workspace/maic/baseline_results.csv"
+    csv_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "baseline_results.csv")
     df.write_csv(csv_path)
     logger.info(f"CSV saved to {csv_path}")
 

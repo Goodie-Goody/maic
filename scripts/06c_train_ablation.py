@@ -36,7 +36,7 @@ from config import ASSETS, BUCKET, WINDOWS
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/workspace/maic/gcp-key.json"
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gcp-key.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,8 +58,8 @@ RESULTS_PREFIX  = "v2/results_ablation/"
 
 # Reuse 06b's data cache — base features already downloaded, no re-download needed.
 # Fracdiff files get their own suffix to avoid filename collision.
-CACHE_DIR       = "/workspace/maic/data_cache"
-STAGE_CACHE_DIR = "/workspace/maic/stage_cache_ablation"
+CACHE_DIR       = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_cache")
+STAGE_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "stage_cache_ablation")
 
 # Ablation runs on fold 4 only — largest expanding window, most representative.
 # Controls and experiments are named conditions, not separate runs.

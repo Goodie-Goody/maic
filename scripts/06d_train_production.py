@@ -37,7 +37,7 @@ from config import ASSETS, BUCKET, WINDOWS
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/workspace/maic/gcp-key.json"
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gcp-key.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,7 +56,7 @@ LABELS_PREFIX   = "v2/labels/"
 
 # Base data cache — separate from 06b to avoid cross-contamination with raw features.
 # Fracdiff files have a different internal structure so they must be cached separately.
-CACHE_DIR = "/workspace/maic/data_cache_production"
+CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_cache_production")
 
 # PRODUCTION PROTOCOL
 
@@ -1027,7 +1027,7 @@ def main():
         # Seed-scoped routing — explicit parameters, not global mutation.
         # If an exception fires mid-seed, the next seed still gets correct paths.
         results_prefix  = f"v2/results_production/seed_{seed}/"
-        stage_cache_dir = f"/workspace/maic/stage_cache_prod_seed_{seed}"
+        stage_cache_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), f"stage_cache_prod_seed_{seed}")
 
         # Pre-flight for this seed's stage cache
         os.makedirs(stage_cache_dir, exist_ok=True)

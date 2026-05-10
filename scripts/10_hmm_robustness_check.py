@@ -17,7 +17,7 @@ from google.cloud import storage
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import ASSETS, BUCKET, WINDOWS
 
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/workspace/maic/gcp-key.json"
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gcp-key.json")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,7 +69,7 @@ LABELS_GLOBAL_PREFIX   = "v2/labels/"
 # at runtime — see load_global_xgb_metrics() below.
 
 # Output
-OUTPUT_DIR = "/workspace/maic"
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "")
 
 
 # =============================================================================

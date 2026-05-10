@@ -24,7 +24,7 @@ def main():
     import os as _os
     _os.environ.setdefault(
         "GOOGLE_APPLICATION_CREDENTIALS",
-        "/workspace/maic/gcp-key.json"
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gcp-key.json")
     )
     from google.cloud import storage as _storage
     _client = _storage.Client()
