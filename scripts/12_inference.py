@@ -127,7 +127,9 @@ def get_model_features(is_pooled=True):
     return POOLED_FEATURES if is_pooled else ASSET_SPECIFIC_FEATURES
 
 # Rolling stress history for continuity condition
-_stress_history = {asset: [] for asset in ASSETS}
+# Buffer size 288 = 24 hours of 5-minute bars — never loses duration context
+_stress_history  = {asset: [] for asset in ASSETS}
+_stress_duration = {asset: 0  for asset in ASSETS}   # true consecutive bar count
 
 # ANSI colours
 RED    = "\033[91m"
@@ -706,19 +708,21 @@ def run_inference(asset, model_pkl, price_history):
         return _err(asset, ts, f"Inference error: {e}")
 
     # Continuity condition
+    # _stress_history: rolling window for display (last 288 bars = 24h)
+    # _stress_duration: true consecutive count, never capped
     hist = _stress_history[asset]
     hist.append(stress_prob)
-    if len(hist) > 10:
+    if len(hist) > 288:
         hist.pop(0)
 
-    consecutive = 0
-    for p in reversed(hist):
-        if p > STRESS_THRESHOLD:
-            consecutive += 1
-        else:
-            break
+    # Update true duration counter
+    if stress_prob > STRESS_THRESHOLD:
+        _stress_duration[asset] += 1
+    else:
+        _stress_duration[asset] = 0
 
-    warning = consecutive >= MIN_CONSECUTIVE
+    consecutive = _stress_duration[asset]
+    warning     = consecutive >= MIN_CONSECUTIVE
 
     if stress_prob >= STRESS_THRESHOLD:
         regime = "stress"
