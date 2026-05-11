@@ -165,7 +165,15 @@ CRISIS_EVENTS = [
     },
 ]
 
-# Walk-forward fold test windows — matches config.py WINDOWS
+# Walk-forward fold structure — matches config.py WINDOWS
+# FOLD_TRAIN_WINDOWS needed to resolve baseline window for drawdown validator
+FOLD_TRAIN_WINDOWS = {
+    1: [WINDOWS[0]],
+    2: [WINDOWS[0], WINDOWS[1]],
+    3: [WINDOWS[0], WINDOWS[1], WINDOWS[2]],
+    4: [WINDOWS[0], WINDOWS[1], WINDOWS[2], WINDOWS[3]],
+}
+
 FOLD_TEST_WINDOWS = {
     1: WINDOWS[1],
     2: WINDOWS[2],
@@ -359,8 +367,16 @@ def compute_price_drawdown(bucket, asset, start_date, end_date,
     )
 
     if features_df is None or features_df.is_empty():
+        logger.warning(
+            f"  compute_price_drawdown: no price data for {asset} "
+            f"{start_date} to {end_date}"
+        )
         return None, None
 
+    logger.debug(
+        f"  compute_price_drawdown: {asset} {start_date}->{end_date} "
+        f"loaded {len(features_df)} bars"
+    )
     prices = features_df["price"].to_numpy().astype(np.float64)
     prices = np.where(np.isfinite(prices) & (prices > 0), prices, np.nan)
 
@@ -516,16 +532,16 @@ def build_crisis_timestamp_binary(n_bars, times_series, onset, crisis_end):
     Binary array: 1 if bar falls within the documented crisis window.
     Externally defined — not derived from this dataset.
     """
-    onset_dt = pl.Series([onset]).str.to_datetime(
-        format="%Y-%m-%d", time_unit="us", time_zone="UTC")[0]
-    end_dt   = pl.Series([crisis_end]).str.to_datetime(
-        format="%Y-%m-%d", time_unit="us", time_zone="UTC")[0]
+    # Convert times to int64 microseconds for timezone-safe comparison
+    onset_us = int(pl.Series([onset]).str.to_datetime(
+        format="%Y-%m-%d", time_unit="us", time_zone="UTC"
+    ).cast(pl.Int64)[0])
+    end_us = int(pl.Series([crisis_end]).str.to_datetime(
+        format="%Y-%m-%d", time_unit="us", time_zone="UTC"
+    ).cast(pl.Int64)[0])
 
-    times_np = times_series.to_numpy()
-    binary   = np.array([
-        1 if (onset_dt <= t <= end_dt) else 0
-        for t in times_np
-    ], dtype=int)
+    times_us = times_series.cast(pl.Int64).to_numpy()
+    binary   = ((times_us >= onset_us) & (times_us <= end_us)).astype(int)
     return binary
 
 
@@ -584,8 +600,17 @@ def run_tier2(bucket):
         logger.info(f"\n  Fold {fold_n} | {test_window} | [{crisis_label}]")
 
         # Pre-crisis baseline dates for drawdown threshold
-        pre_start = offset_date(f"{test_window[0]}-01", -PRE_CRISIS_DAYS)
-        pre_end   = offset_date(f"{test_window[0]}-01", -1)
+        # Use the last month of the preceding training window — avoids the
+        # deliberate gap between WINDOWS where no feature parquets exist.
+        # Fold train windows: 1=[W0], 2=[W0,W1], 3=[W0,W1,W2], 4=[W0,W1,W2,W3]
+        # Preceding window end months: Fold1=2020-07, Fold2=2021-05,
+        #                              Fold3=2022-05, Fold4=2023-04
+        _preceding_window_end = FOLD_TRAIN_WINDOWS[fold_n][-1][1]  # last train window end
+        pre_start = f"{_preceding_window_end[:4]}-{int(_preceding_window_end[5:])-1:02d}-01" \
+            if int(_preceding_window_end[5:]) > 1 else \
+            f"{int(_preceding_window_end[:4])-1}-12-01"
+        pre_end   = f"{_preceding_window_end}-28"
+        logger.info(f"  Drawdown baseline: {pre_start} → {pre_end}")
 
         # Collect per-asset cross-asset labels (global) for validator 3
         global_stress_by_asset = {}
@@ -634,6 +659,11 @@ def run_tier2(bucket):
                 bucket, asset, test_window, pre_start, pre_end
             )
 
+            if drawdown_binary is None:
+                logger.warning(
+                    f"    Price drawdown: no data for {asset} Fold {fold_n} "
+                    f"(pre_start={pre_start} pre_end={pre_end})"
+                )
             if drawdown_binary is not None and len(drawdown_binary) > 0:
                 # Align with global labels by length (both cover same window)
                 n_align = min(n_global, len(drawdown_binary))
@@ -1021,13 +1051,14 @@ def plot_tier1_stress_rates(summary_df):
             [a.replace("USDT", "") for a in assets], rotation=45
         )
         if i == 0:
-            ax.set_ylabel("HMM Stress Label Rate (%)")
+            ax.set_ylabel("Global HMM Stress Label Rate (%)")
         if i == len(CRISIS_EVENTS) - 1:
             ax.legend(framealpha=0.85)
 
     plt.suptitle(
-        "Tier 1: HMM Stress Rate — Pre-Crisis vs Crisis Windows",
-        fontsize=12, fontweight="bold", y=1.02
+        "Tier 1: Global HMM Stress Rate — Pre-Crisis vs Crisis Windows\n"
+        "(Labels: globally-fitted 3-state Gaussian HMM, all assets, full sample)",
+        fontsize=11, fontweight="bold", y=1.02
     )
     plt.tight_layout()
     plt.savefig(os.path.join(FIGURE_DIR, "fig_tier1_crisis_rates.png"))
@@ -1117,28 +1148,50 @@ def plot_tier3_silent_events(silent_df):
         return
     logger.info("  Generating Tier 3 figure: Silent Events...")
 
-    plt.figure(figsize=(9, 6))
-    for asset in ASSETS:
-        ad = silent_df.filter(pl.col("asset") == asset)
-        if ad.is_empty():
-            continue
-        plt.scatter(
-            ad["duration_mins"], ad["mean_price"],
-            color=ASSET_COLORS[asset], label=asset,
-            s=90, alpha=0.75, edgecolors="k", linewidth=0.5
+    # Build label: "ASSET  YYYY-MM-DD"
+    rows = silent_df.sort("duration_mins", descending=True).to_dicts()
+    labels      = [f"{r['asset'].replace('USDT','')}  {r['start_time'][:10]}"
+                   for r in rows]
+    durations   = [r["duration_mins"] / 60 for r in rows]   # convert to hours
+    colors      = [ASSET_COLORS[r["asset"]] for r in rows]
+
+    fig, ax = plt.subplots(figsize=(10, max(5, len(rows) * 0.55)))
+    y_pos = np.arange(len(rows))
+
+    bars = ax.barh(y_pos, durations, color=colors, alpha=0.82,
+                   edgecolor="k", linewidth=0.4)
+
+    # Annotate each bar with duration in hours
+    for bar, dur in zip(bars, durations):
+        ax.text(
+            bar.get_width() + max(durations) * 0.01,
+            bar.get_y() + bar.get_height() / 2,
+            f"{dur:.0f}h",
+            va="center", ha="left", fontsize=8
         )
 
-    plt.xscale("log")
-    plt.xlabel("Duration (minutes) — Log Scale")
-    plt.ylabel("Mean Price During Event (USDT)")
-    plt.title(
-        "Tier 3: Detected Silent Microstructure Stress Events\n"
-        "(outside known crisis windows, ≥60 min duration)"
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(labels, fontsize=8)
+    ax.invert_yaxis()
+    ax.set_xlabel("Duration (hours)")
+    ax.set_title(
+        "Tier 3: Silent Microstructure Stress Events Detected by Global HMM\n"
+        "(outside known crisis windows, ≥60 min duration, ranked by duration)",
+        fontweight="bold"
     )
-    plt.legend(framealpha=0.85)
+
+    # Legend patches
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor=ASSET_COLORS[a], edgecolor="k", label=a)
+        for a in ASSETS if any(r["asset"] == a for r in rows)
+    ]
+    ax.legend(handles=legend_elements, framealpha=0.85, fontsize=8)
+
     plt.tight_layout()
     plt.savefig(
-        os.path.join(FIGURE_DIR, "fig_tier3_silent_events.png")
+        os.path.join(FIGURE_DIR, "fig_tier3_silent_events.png"),
+        bbox_inches="tight"
     )
     plt.close()
     logger.info("    Saved: fig_tier3_silent_events.png")
