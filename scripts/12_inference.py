@@ -218,16 +218,26 @@ def log_pending_outcome(result, raw_price):
         if header_needed:
             f.write("signal_time,asset,price_at_signal,stress_prob,"
                     "consecutive_bars,check_at_unix,"
-                    "price_at_check,price_change_pct,outcome\n")
+                    "min_price_in_window,min_change_pct,outcome\n")
         f.write(row)
 def check_pending_outcomes():
     """
     Check any pending outcomes whose 30-minute window has elapsed.
-    Fetches current price from Binance klines and fills in the result.
 
-    outcome = TRUE_POSITIVE  if price dropped >= PRICE_DROP_THRESHOLD_PCT
-    outcome = FALSE_POSITIVE if price did not drop
-    outcome = EARLY          if price drop happened but less than threshold
+    Uses MINIMUM price over the 30-minute window (from klines) rather than
+    price at exactly T+30min. This correctly captures stress events where
+    price dipped and recovered — a common pattern where liquidity absorbs
+    the stress without permanent price dislocation.
+
+    Microstructure theory note: stress regimes reflect liquidity CONDITIONS,
+    not guaranteed price direction. A TRUE_POSITIVE means the stress signal
+    preceded genuine price pressure, even if the market ultimately absorbed
+    it. FALSE_POSITIVE means price never deteriorated during the window at all.
+
+    outcome = STRESS_CONFIRMED   price dropped >= threshold at any point
+    outcome = STRESS_ABSORBED    price dropped but recovered (< threshold at end)
+    outcome = FALSE_POSITIVE     price never dropped meaningfully
+    outcome = PRICE_PUMPED       price rose significantly (opposite direction)
     """
     if not os.path.exists(OUTCOME_LOG):
         return
@@ -243,8 +253,8 @@ def check_pending_outcomes():
     if len(lines) <= 1:
         return
 
-    header   = lines[0]
-    updated  = [header]
+    header      = lines[0]
+    updated     = [header]
     any_updated = False
 
     for line in lines[1:]:
@@ -254,7 +264,7 @@ def check_pending_outcomes():
             continue
 
         # Already resolved
-        if parts[8].strip() not in ("", ):
+        if parts[8].strip():
             updated.append(line)
             continue
 
@@ -263,37 +273,62 @@ def check_pending_outcomes():
             updated.append(line)
             continue
 
-        # Time to check
         asset           = parts[1]
         price_at_signal = float(parts[2])
+        signal_unix     = check_at - OUTCOME_DELAY_S
 
         try:
-            # Fetch current price from Binance
+            # Fetch all 1-minute klines over the 30-minute window
+            # to find the MINIMUM price (worst drawdown)
             resp = requests.get(
                 f"{BINANCE_BASE}{KLINES_ENDPOINT}",
-                params={"symbol": asset, "interval": "1m", "limit": 1},
+                params={
+                    "symbol":    asset,
+                    "interval":  "1m",
+                    "startTime": int(signal_unix * 1000),
+                    "endTime":   int(check_at * 1000),
+                    "limit":     35,
+                },
                 timeout=10
             )
             resp.raise_for_status()
             klines = resp.json()
-            price_now = float(klines[-1][4]) if klines else price_at_signal
 
-            change_pct = ((price_now - price_at_signal) / price_at_signal) * 100
+            if not klines:
+                updated.append(line)
+                continue
 
-            if change_pct <= -PRICE_DROP_THRESHOLD_PCT:
-                outcome = "TRUE_POSITIVE"
-            elif change_pct >= PRICE_DROP_THRESHOLD_PCT:
-                outcome = "FALSE_POSITIVE_PUMP"
+            # Extract low prices across the window — captures intrabar drops
+            lows      = [float(k[3]) for k in klines]   # k[3] = low
+            closes    = [float(k[4]) for k in klines]    # k[4] = close
+            price_min = min(lows)
+            price_end = closes[-1]
+
+            min_change_pct = ((price_min - price_at_signal)
+                              / price_at_signal) * 100
+            end_change_pct = ((price_end - price_at_signal)
+                              / price_at_signal) * 100
+
+            # Classification based on minimum price in window
+            if min_change_pct <= -PRICE_DROP_THRESHOLD_PCT:
+                if end_change_pct <= -PRICE_DROP_THRESHOLD_PCT:
+                    outcome = "STRESS_CONFIRMED"     # dropped and stayed down
+                else:
+                    outcome = "STRESS_ABSORBED"      # dropped but recovered
+            elif end_change_pct >= PRICE_DROP_THRESHOLD_PCT:
+                outcome = "PRICE_PUMPED"             # went up instead
             else:
-                outcome = "FALSE_POSITIVE"
+                outcome = "FALSE_POSITIVE"           # never moved meaningfully
 
-            parts[6] = f"{price_now:.4f}"
-            parts[7] = f"{change_pct:.3f}"
+            parts[6] = f"{price_min:.4f}"   # worst price in window
+            parts[7] = f"{min_change_pct:.3f}"
             parts[8] = outcome
 
             logger.info(
                 f"  OUTCOME [{asset}]: signal={price_at_signal:.2f} "
-                f"→ now={price_now:.2f} ({change_pct:+.3f}%) = {outcome}"
+                f"min={price_min:.2f} ({min_change_pct:+.3f}%) "
+                f"end={price_end:.2f} ({end_change_pct:+.3f}%) "
+                f"= {outcome}"
             )
             any_updated = True
 
@@ -739,8 +774,12 @@ def _interpret(prob, warning, consec, feats):
     if warning:
         lines.append(
             f"WARNING ACTIVE for {consec} bars (~{consec*5} min). "
-            f"Based on paper lead-time analysis: price impact typically "
-            f"follows within 1-3 hours for acute events."
+            f"Microstructure stress reflects deteriorating LIQUIDITY CONDITIONS "
+            f"— elevated sell pressure, thin depth, abnormal trade flow. "
+            f"Price impact is NOT guaranteed: liquid markets may absorb stress "
+            f"without significant price movement. "
+            f"For acute structural events, historical lead time is 1-3 hours "
+            f"(Terra-Luna: 108min, FTX: 176min). Monitor for sustained deterioration."
         )
 
     ofi = feats.get("OFI_300s", 0)
@@ -785,7 +824,8 @@ def print_result(result, as_json=False):
   Price:        ${result['price']:,.4f}
   Stress prob:  {c}{BOLD}{prob:.1%}{RESET}
   Regime:       {c}{regime.upper()}{RESET}
-  Trades used:  {result['n_trades_used']:,} (last {result.get('window_seconds', 300)}s window){alert}
+  Trades used:  {result['n_trades_used']:,} (last {result.get('window_seconds', 300)}s window)
+  Note:         Stress = liquidity conditions, NOT a price prediction{alert}
 
   Key microstructure signals:
     OFI 300s:       {result['key_features']['OFI_300s']:+.4f}
