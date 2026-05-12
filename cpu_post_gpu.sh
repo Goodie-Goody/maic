@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # MAIC — CPU Pipeline (Post-GPU)
-# Runs aggregation, figure generation, lead-time analysis, and HMM robustness
-# check. Requires gpu_pipeline.sh to have completed first.
+# Runs aggregation, figure generation, lead-time analysis, HMM robustness,
+# external crisis validation, and optionally the live inference system.
 #
 # Usage:
 #   bash cpu_post_gpu.sh             # run all stages
@@ -59,9 +59,9 @@ fail() { echo -e "${RED}[$(date '+%H:%M:%S')] ✗ $1${NC}"; exit 1; }
 info() { echo -e "${CYAN}                    $1${NC}"; }
 
 # -----------------------------------------------------------------------------
-# STAGE DEFINITIONS — post-GPU only
+# STAGE DEFINITIONS
 # -----------------------------------------------------------------------------
-declare -a STAGE_NUMS=(1 2 3 4 5 6 7)
+declare -a STAGE_NUMS=(1 2 3 4 5 6 7 8 9)
 declare -a STAGE_NAMES=(
     "07a_aggregate_baseline"
     "07b_aggregate_ablation"
@@ -70,6 +70,8 @@ declare -a STAGE_NAMES=(
     "09_lead_time_analysis"
     "10_hmm_robustness_check"
     "11_crisis_validation"
+    "11a_hmm_stability_local"
+    "11b_crisis_validation_full"
 )
 declare -a STAGE_SCRIPTS=(
     "scripts/07a_aggregate_results.py"
@@ -79,6 +81,8 @@ declare -a STAGE_SCRIPTS=(
     "scripts/09_lead_time_analysis.py"
     "scripts/10_hmm_robustness_check.py"
     "scripts/11_crisis_validation.py"
+    "scripts/11a_local_global_hmm.py"
+    "scripts/11b_crisis_validation_full.py"
 )
 
 NUM_STAGES=${#STAGE_NUMS[@]}
@@ -221,6 +225,8 @@ if [ "$DRY_RUN" -eq 1 ]; then
         fi
     done
     echo ""
+    log "  Stage 10 (12_inference) — WOULD PROMPT: run live inference? [y/N]"
+    echo ""
     exit 0
 fi
 
@@ -234,7 +240,7 @@ run_stage() {
 
     [ "$stage_num" -lt "$FROM_STAGE" ] && { warn "Stage $stage_num ($stage_name) — skipped"; return; }
     [ -f "$done_marker" ] && { ok "Stage $stage_num ($stage_name) — already done, skipping"; return; }
-    [ ! -f "$script" ] && fail "Script not found: $script"
+    [ ! -f "$script" ] && { warn "Stage $stage_num ($stage_name) — script not found, skipping"; return; }
 
     log "Stage $stage_num ($stage_name) — starting"
     info "Log: $log_file"
@@ -252,16 +258,66 @@ for i in $(seq 0 $((NUM_STAGES - 1))); do
 done
 
 # -----------------------------------------------------------------------------
+# STAGE 10 — LIVE INFERENCE (optional, prompted)
+# -----------------------------------------------------------------------------
+echo ""
+echo "============================================================"
+echo "  OPTIONAL: Live Inference System"
+echo "============================================================"
+echo ""
+echo "  The early warning system can now run against live Binance"
+echo "  data using the production XGBoost model."
+echo ""
+echo "  Note: Stress = liquidity conditions, NOT a price prediction."
+echo "  Price impact is not guaranteed — liquid markets may absorb"
+echo "  stress without significant price movement."
+echo ""
+echo -n "  Run live inference monitoring? [y/N]: "
+read -r run_inference
+
+if [[ "$run_inference" =~ ^[Yy]$ ]]; then
+    echo ""
+    echo -n "  Monitor which asset? [BTCUSDT/ETHUSDT/SOLUSDT/all] (default: all): "
+    read -r asset_choice
+    asset_choice=${asset_choice:-all}
+
+    echo ""
+    echo -n "  Run continuously (--loop) or single snapshot? [loop/single] (default: loop): "
+    read -r mode_choice
+    mode_choice=${mode_choice:-loop}
+
+    echo ""
+    log "Starting inference: asset=$asset_choice mode=$mode_choice"
+    info "Logs → logs/inference/inference_log.csv"
+    info "Outcomes → logs/inference/outcome_log.csv (resolved 30 min after each WARNING)"
+    info "Press Ctrl+C to stop continuous monitoring"
+    echo ""
+
+    if [[ "$mode_choice" == "loop" ]]; then
+        python3 scripts/12_inference.py --asset "$asset_choice" --loop
+    else
+        python3 scripts/12_inference.py --asset "$asset_choice"
+    fi
+else
+    echo ""
+    info "Inference skipped. Run manually at any time:"
+    info "  python3 scripts/12_inference.py --asset all --loop"
+    info "  python3 scripts/12_inference.py --asset BTCUSDT"
+fi
+
+# -----------------------------------------------------------------------------
 # DONE
 # -----------------------------------------------------------------------------
 echo ""
 echo "============================================================"
-ok "Post-GPU CPU pipeline complete — all done"
+ok "Post-GPU CPU pipeline complete"
 echo ""
-info "Results    : production_results.csv"
-info "Lead times : lead_time_results.csv"
-info "Robustness : hmm_robustness_*.csv"
-info "Validation : crisis_validation_*.csv (Tier 1 & 2)"
-info "Figures    : paper_figures/"
+info "Results      : production_results.csv"
+info "Lead times   : lead_time_results.csv"
+info "Robustness   : hmm_robustness_*.csv"
+info "Stability    : global_hmm_stability.csv"
+info "Validation   : crisis_validation_*.csv + global_vs_local_kappa.csv"
+info "Figures      : paper_figures/"
+info "Inference    : logs/inference/ (if run)"
 echo "============================================================"
 echo ""
