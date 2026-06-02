@@ -61,7 +61,7 @@ info() { echo -e "${CYAN}                    $1${NC}"; }
 # -----------------------------------------------------------------------------
 # STAGE DEFINITIONS
 # -----------------------------------------------------------------------------
-declare -a STAGE_NUMS=(1 2 3 4 5 6 7 8 9)
+declare -a STAGE_NUMS=(1 2 3 4 5 6 7 8)
 declare -a STAGE_NAMES=(
     "07a_aggregate_baseline"
     "07b_aggregate_ablation"
@@ -69,7 +69,6 @@ declare -a STAGE_NAMES=(
     "08_generate_paper_figures"
     "09_lead_time_analysis"
     "10_hmm_robustness_check"
-    "11_crisis_validation"
     "11a_hmm_stability_local"
     "11b_crisis_validation_full"
 )
@@ -80,7 +79,6 @@ declare -a STAGE_SCRIPTS=(
     "scripts/08_generate_paper_figures.py"
     "scripts/09_lead_time_analysis.py"
     "scripts/10_hmm_robustness_check.py"
-    "scripts/11_crisis_validation.py"
     "scripts/11a_local_global_hmm.py"
     "scripts/11b_crisis_validation_full.py"
 )
@@ -225,7 +223,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
         fi
     done
     echo ""
-    log "  Stage 10 (12_inference) — WOULD PROMPT: run live inference? [y/N]"
+    log "  Stage 9 (12_inference) — WOULD PROMPT: run live inference? [y/N]"
     echo ""
     exit 0
 fi
