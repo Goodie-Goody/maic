@@ -4,28 +4,31 @@
 ![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20RunPod-lightgrey.svg)
 ![GPU](https://img.shields.io/badge/GPU-CUDA%2012.8-green.svg)
+![SSRN](https://img.shields.io/badge/SSRN-10.2139%2Fssrn.6761438-blue.svg)
 
-> **Paper:** *Early Warning System for Liquidity Stress in Cryptocurrency Markets Using Trade Flow Analysis and Machine Learning*
-> Goodness Kalu, Uchenna Ejike, Joseph Edet, Emmanuel Fagbuyi, Godfrey Kunde, and Hannah Igboke
-> WorldQuant University · Preprint submitted May 2026
+> **Paper:** *An Early Warning System for Liquidity Stress in Cryptocurrency Markets Using Trade Flow Analysis and Machine Learning*
+> Goodness Kalu, Uchenna Ejike, Joseph Edet, Temitope E. Fagbuyi, Godfrey Kunde, and Hannah Igboke
+> WorldQuant University · Preprint: [SSRN 10.2139/ssrn.6761438](https://doi.org/10.2139/ssrn.6761438) · Submitted to ACM ICAIF 2026
 
-This repository contains the complete, fully reproducible research pipeline — from raw Binance trade data to trained models, publication figures, lead-time analysis, HMM robustness validation, external crisis validation, and a live inference system. Every number in the paper traces back to a script in this repository.
+This repository contains the complete, fully reproducible research pipeline — from raw Binance trade data to trained models, publication figures, lead-time analysis, HMM robustness validation, external crisis validation, persistence baselines, and a live inference system. Every number in the paper traces back to a script in this repository.
 
 ---
 
 ## What This Repository Does
 
-Cryptocurrency markets can collapse within minutes. Traditional risk systems are too slow. This project builds an early warning system for liquidity stress using only publicly available high-frequency trade data from Binance.
+Cryptocurrency markets can collapse within minutes. Traditional risk systems are too slow. This project builds an early warning system for liquidity stress in Binance spot markets using only publicly available high-frequency trade data.
 
-> **Important:** This system detects deteriorating **liquidity conditions** — not price direction. Microstructure stress reflects elevated sell pressure, thin market depth, and abnormal trade flow. Price impact is not guaranteed: liquid markets may absorb stress without significant price movement. For acute structural events, historical lead times are 1–3 hours (Terra-Luna: 108 min, FTX: 176 min).
+> **Important:** This system detects deteriorating **liquidity conditions** — not price direction. Microstructure stress reflects elevated sell pressure, thin market depth, and abnormal trade flow. Price impact is not guaranteed: liquid markets may absorb stress without significant price movement. For acute structural events, historical lead times against external reference definitions are 56 min (FTX) and 108 min (Terra-Luna).
 
 **The core findings:**
-- XGBoost on trade-based microstructure features achieves binary weighted F1 of **0.9706** on the final out-of-sample window, with near-zero variance across random seeds (range: 0.0006)
-- The framework provides **108–176 minutes** of actionable early warning before acute structural collapses (Terra-Luna, FTX), and detects sustained deterioration events (May 2021) at least 4 hours before HMM-defined onset
-- A controlled experiment comparing global vs local HMM labelling across all four folds proves global fitting is methodologically superior — local HMMs trained on narrow windows produce stress percentages ranging from 6% to 94.3% for the same assets and periods, demonstrating systematic miscalibration
-- Three-tier external validation using genuinely independent validators (price drawdown, documented crisis timestamps, cross-asset simultaneous stress) confirms the HMM labels are economically meaningful — not self-referential
-- Global HMM is near-deterministic: ETH and SOL models show **0.00e+00** parameter difference between independent training runs; BTC shows differences of 10⁻⁷ — floating point noise
-- A live inference system (`scripts/12_inference.py`) runs against the Binance public API with no authentication required, logging stress probabilities and outcome tracking in real time
+- XGBoost achieves binary weighted F1 of **0.9706** on the final out-of-sample window (18.8M training rows), with near-zero seed variance (range: 0.0006)
+- Against externally documented crisis triggers: **56 minutes** before the FTX event and **108 minutes** before the Terra-Luna structural break — measured against publicly observable events, not HMM-defined state transitions
+- A persistence baseline (predict today's label = yesterday's) achieves stress-class F1 of 0.517–0.746 across folds; XGBoost lifts this by +0.218 to +0.390, confirming genuine predictive skill beyond regime momentum
+- A cross-evaluation falsification test confirms XGBoost is not recovering HMM label geometry: stress F1 collapses from 0.988 to 0.480 when a locally-trained model is evaluated against global labels
+- Global vs local HMM controlled experiment: local HMMs trained on narrow windows produce stress percentages of 6.0% to 94.3% for identical assets and periods — systematic miscalibration
+- Three-tier external validation using genuinely independent validators (price drawdown, documented crisis timestamps, cross-asset simultaneous stress) confirms the HMM labels are consistent with genuine economic stress
+- Global HMM is near-deterministic: ETH and SOL show **0.00e+00** parameter difference between independent training runs; BTC shows **2.66e-07** — floating point noise
+- A live inference system (`scripts/12_inference.py`) runs against the Binance public API with no authentication required
 
 ---
 
@@ -38,7 +41,7 @@ maic/
 ├── setup.sh                               # One-command environment setup (GPU-adaptive)
 ├── cpu_pipeline.sh                        # Stages 01–05b (CPU)
 ├── gpu_pipeline.sh                        # Stages 06a–06d (GPU required)
-├── cpu_post_gpu.sh                        # Stages 07a–12 (CPU)
+├── cpu_post_gpu.sh                        # Stages 07a–13b + inference prompt (CPU)
 ├── status.sh                              # Pipeline status dashboard
 ├── .env.example                           # Environment variable template
 ├── scripts/
@@ -47,7 +50,7 @@ maic/
 │   ├── 03_quality_audit.py                # Three-layer data quality audit
 │   ├── 04a_feature_engineering.py         # Compute microstructure features
 │   ├── 04b_stationarity_fracdiff.py       # ADF testing + fractional differencing
-│   ├── 05a_label_generation.py            # HMM regime labelling
+│   ├── 05a_label_generation.py            # Global HMM regime labelling (Viterbi)
 │   ├── 05b_verify_features.py             # Feature dataset verification
 │   ├── 06a_train_models.py                # Baseline training
 │   ├── 06b_train_models.py                # Extended training
@@ -57,10 +60,12 @@ maic/
 │   ├── 07b_aggregate_ablation.py          # Aggregate ablation results
 │   ├── 07c_aggregate_production.py        # Aggregate production results
 │   ├── 08_generate_paper_figures.py       # Generate all publication figures
-│   ├── 09_lead_time_analysis.py           # Predictive lead-time analysis
-│   ├── 10_hmm_robustness_check.py         # HMM Fold 3 robustness check
-│   ├── 11a_hmm_stability_and_local_labels.py  # Global HMM stability + all-fold local HMM
+│   ├── 09_lead_time_analysis.py           # Lead-time analysis (HMM onset)
+│   ├── 10_hmm_robustness_check.py         # HMM robustness check
+│   ├── 11a_local_global_hmm.py            # Global HMM stability + local HMM experiment
 │   ├── 11b_crisis_validation_full.py      # Three-tier external crisis validation
+│   ├── 13a_persistence_baseline.py        # Persistence + majority-class baselines
+│   ├── 13b_lead_time_external.py          # Lead-time against external reference defs
 │   └── 12_inference.py                    # Live stress detection from Binance API
 └── docs/
     └── walkthrough.md                     # Detailed step-by-step infrastructure guide
@@ -131,13 +136,25 @@ Purged expanding walk-forward cross-validation with 30-minute embargo. Five mode
 
 **Fold 4 (18.8M training rows):** XGBoost binary F1 = **0.9706**, seed range = 0.0006.
 
-**Lead-time analysis:**
+**Persistence baseline vs XGBoost (binary, stress-class F1):**
 
-| Event | Lead Time |
-|-------|-----------|
-| May 2021 Crash | ≥ 240 min |
-| Terra-Luna | 108.3 min |
-| FTX Bankruptcy | 176.0 min |
+| Fold | Stress% | Persistence | XGBoost | Lift |
+|------|---------|------------|---------|------|
+| 1 | 31.2% | 0.566 | 0.793 | +0.227 |
+| 2 | 9.9% | 0.539 | 0.896 | +0.357 |
+| 3 | 11.0% | 0.517 | 0.907 | +0.390 |
+| 4 | 41.5% | 0.746 | 0.964 | +0.218 |
+
+**Lead-time analysis (XGBoost binary, seed 42, pooled):**
+
+| Event | To HMM Onset | To External Reference |
+|-------|--------------|-----------------------|
+| May 2021 Crash | persistent signal† | persistent signal† |
+| Terra-Luna Collapse | 108.3 min | 108.3 min |
+| FTX Bankruptcy | 176.0 min | 56.0 min‡ |
+
+†Signal present throughout 12-hour search window; true onset predates lookback. Consistent with the sustained deterioration character of this event.
+‡External reference: CZ tweet / FTT sell order at 12:00 UTC. HMM onset at 14:00 UTC.
 
 **External validation (Script 11b, cross-asset kappa):**
 
@@ -149,7 +166,15 @@ Purged expanding walk-forward cross-validation with 30-minute embargo. Five mode
 | 3 | BTCUSDT | 0.775 (substantial) | 0.088 (slight) |
 | 4 | ETHUSDT | 0.840 (almost perfect) | 0.621 (substantial) |
 
-Global HMM consistently achieves substantially higher agreement with independent external validators than local HMM across all folds and assets.
+**Cross-evaluation falsification test (Script 10):**
+
+| Evaluation | F1-W | F1-Stress |
+|------------|------|-----------|
+| Local trained, local tested | 0.9917 | 0.9881 |
+| Local trained, global tested | 0.8066 | 0.4802 |
+| Global production | 0.9801 | 0.9065 |
+
+The collapse from 0.988 to 0.480 on stress F1 when cross-evaluating confirms the two label sets encode genuinely different information. XGBoost is not recovering HMM label geometry.
 
 ---
 
@@ -172,9 +197,9 @@ python3 scripts/12_inference.py --asset BTCUSDT --json
 ```
 
 The inference script:
-- Fetches all aggregated trades in the last 300 seconds via Binance public API
+- Fetches all aggregated trades in the last 300 seconds via Binance public API with full pagination
 - Computes all microstructure features identically to the training pipeline
-- Applies asset-specific fractional differencing to price
+- Applies asset-specific fractional differencing to price in place
 - Runs the production XGBoost model (Fold 4, Seed 42, pooled)
 - Applies the continuity condition: WARNING when P(stress) > 0.85 for ≥ 2 consecutive bars
 - Logs every inference to `logs/inference/inference_log.csv`
@@ -182,44 +207,9 @@ The inference script:
 
 **Outcome classifications:**
 - `STRESS_CONFIRMED` — price dropped ≥ 0.3% and stayed down
-- `STRESS_ABSORBED` — price dropped ≥ 0.3% but recovered (stress resolved by liquidity)
+- `STRESS_ABSORBED` — price dropped ≥ 0.3% but recovered
 - `FALSE_POSITIVE` — price never moved meaningfully
-- `PRICE_PUMPED` — price rose instead (short squeeze dynamic)
-
-The first production model (`xgb_binary_pooled_fold4_seed42.pkl`) is downloaded automatically from GCS on first run and cached locally.
-
----
-
-## Validation Scripts
-
-### Script 11a — HMM Stability and Local Label Generation
-
-Proves global HMM superiority through a controlled experiment:
-
-```bash
-python3 scripts/11a_hmm_stability_and_local_labels.py
-```
-
-**Part A:** Compares April 20 backup HMM models against current production models across all parameters. ETH and SOL show 0.00e+00 difference. BTC shows 10⁻⁷ — floating point noise. The global HMM is deterministic.
-
-**Part B:** Fits local HMMs for all four folds using only training-available data. Produces `global_vs_local_summary.csv` showing local HMM stress% ranging from 6.0% to 94.3% for the same assets and periods — systematic miscalibration vs the global HMM's stable ~19%.
-
-### Script 11b — Three-Tier External Crisis Validation
-
-Validates HMM labels against genuinely independent external signals:
-
-```bash
-python3 scripts/11b_crisis_validation_full.py
-```
-
-**Tier 1:** Z-tests against four documented crisis events (z-scores 100–333, all p ≈ 0).
-
-**Tier 2:** Global vs local HMM measured against three external validators — none of which were HMM training features:
-- Price drawdown (HMM never saw raw price levels)
-- Documented crisis timestamps (externally defined)
-- Cross-asset simultaneous stress (HMM fitted per-asset independently)
-
-**Tier 3:** Silent microstructure stress event discovery outside known crisis windows.
+- `PRICE_PUMPED` — price rose instead
 
 ---
 
@@ -233,7 +223,7 @@ cp /path/to/key.json gcp-key.json
 bash setup.sh                  # installs packages, detects GPU
 bash cpu_pipeline.sh           # stages 01–05b: data prep
 bash gpu_pipeline.sh           # stages 06a–06d: model training (GPU required)
-bash cpu_post_gpu.sh           # stages 07a–12: analysis + validation + inference
+bash cpu_post_gpu.sh           # stages 07a–13b: analysis + validation + inference
 ```
 
 For detailed setup including GCP provisioning, BigQuery external tables, and RunPod configuration, see [`docs/walkthrough.md`](docs/walkthrough.md).
@@ -244,10 +234,12 @@ For detailed setup including GCP provisioning, BigQuery external tables, and Run
 
 | Path | Contents |
 |------|----------|
+| `v2/features/` | Raw microstructure features |
 | `v2/features_fracdiff/` | Fractionally differenced features (model input) |
 | `v2/labels/` | Global HMM labels (0=calm, 1=elevated, 2=stress) |
-| `v2/labels_local/fold_{n}/` | Local HMM labels per fold (generated by 11a) |
+| `v2/labels_local/fold_{n}/` | Local HMM labels per fold |
 | `v2/results_production/` | Production run outputs (5 seeds × 4 folds) |
+| `v2/results/` | Aggregated result CSVs |
 | `v2/paper_figures/` | Publication figures |
 | `v2/pipeline_markers/` | Script completion markers |
 
@@ -261,7 +253,7 @@ Built and validated for under £50 of cloud compute:
 |-------|----------|---------------|
 | Data prep (01–05b) | CPU | < £2 |
 | GPU training (06a–06d) | RTX PRO 4500 Blackwell 34GB | ~ £30 |
-| Analysis (07a–12) | CPU | < £2 |
+| Analysis (07a–13b) | CPU | < £2 |
 | GCS storage | — | ~ £10/month |
 
 ---
@@ -269,13 +261,14 @@ Built and validated for under £50 of cloud compute:
 ## Citation
 
 ```bibtex
-@article{kalu2026maic,
-  title   = {Early Warning System for Liquidity Stress in Cryptocurrency Markets
-             Using Trade Flow Analysis and Machine Learning},
+@misc{kalu2026maic,
+  title   = {An Early Warning System for Liquidity Stress in Cryptocurrency
+             Markets Using Trade Flow Analysis and Machine Learning},
   author  = {Kalu, Goodness and Ejike, Uchenna and Edet, Joseph and
-             Fagbuyi, Emmanuel and Kunde, Godfrey and Igboke, Hannah},
-  journal = {SSRN Preprint},
+             Fagbuyi, {Temitope E.} and Kunde, Godfrey and Igboke, Hannah},
   year    = {2026},
+  note    = {SSRN Preprint},
+  doi     = {10.2139/ssrn.6761438},
   url     = {https://github.com/Goodie-Goody/maic}
 }
 ```
@@ -284,7 +277,7 @@ Built and validated for under £50 of cloud compute:
 
 ## Acknowledgements
 
-WorldQuant University for educational support. The open-source community behind the scientific Python ecosystem. GPU computing provided via RunPod cloud services on an NVIDIA RTX PRO 4500 Blackwell GPU.
+WorldQuant University for educational support. The open-source community behind the scientific Python ecosystem. GPU computing provided via RunPod cloud services on an NVIDIA RTX PRO 4500 Blackwell GPU. Portions of this manuscript were prepared with the assistance of Claude (Anthropic) for editorial refinement and structural review.
 
 ---
 
