@@ -8,7 +8,7 @@
 
 > **Paper:** *An Early Warning System for Liquidity Stress in Cryptocurrency Markets Using Trade Flow Analysis and Machine Learning*
 > Goodness Kalu, Uchenna Ejike, Joseph Edet, Temitope E. Fagbuyi, Godfrey Kunde, and Hannah Igboke
-> WorldQuant University · Preprint: [SSRN 10.2139/ssrn.6761438](https://doi.org/10.2139/ssrn.6761438) · Submitted to ACM ICAIF 2026
+> WorldQuant University · Preprint: [SSRN 10.2139/ssrn.6761438](https://doi.org/10.2139/ssrn.6761438) ·
 
 This repository contains the complete, fully reproducible research pipeline — from raw Binance trade data to trained models, publication figures, lead-time analysis, HMM robustness validation, external crisis validation, persistence baselines, and a live inference system. Every number in the paper traces back to a script in this repository.
 
