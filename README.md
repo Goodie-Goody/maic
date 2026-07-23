@@ -41,7 +41,7 @@ maic/
 ├── setup.sh                               # One-command environment setup (GPU-adaptive)
 ├── cpu_pipeline.sh                        # Stages 01–05b (CPU)
 ├── gpu_pipeline.sh                        # Stages 06a–06d (GPU required)
-├── cpu_post_gpu.sh                        # Stages 07a–13b + inference prompt (CPU)
+├── cpu_post_gpu.sh                        # Stages 07a–13c + inference prompt (CPU)
 ├── status.sh                              # Pipeline status dashboard
 ├── .env.example                           # Environment variable template
 ├── scripts/
@@ -66,6 +66,7 @@ maic/
 │   ├── 11b_crisis_validation_full.py      # Three-tier external crisis validation
 │   ├── 13a_persistence_baseline.py        # Persistence + majority-class baselines
 │   ├── 13b_lead_time_external.py          # Lead-time against external reference defs
+│   ├── 13c_block_bootstrap_ztest.py       # Block bootstrap robustness check (Tier 1 z-tests)
 │   └── 12_inference.py                    # Live stress detection from Binance API
 └── docs/
     └── walkthrough.md                     # Detailed step-by-step infrastructure guide
@@ -199,11 +200,30 @@ python3 scripts/12_inference.py --asset BTCUSDT --json
 The inference script:
 - Fetches all aggregated trades in the last 300 seconds via Binance public API with full pagination
 - Computes all microstructure features identically to the training pipeline
-- Applies asset-specific fractional differencing to price in place
+- Applies fractional differencing to price in place, using a relaxed
+  threshold (1e-3) suited to the ~80 bars of live history available —
+  training uses 1e-5 against years of history, so the threshold differs
+  by design (see code comments in `apply_fracdiff_to_price`)
 - Runs the production XGBoost model (Fold 4, Seed 42, pooled)
 - Applies the continuity condition: WARNING when P(stress) > 0.85 for ≥ 2 consecutive bars
 - Logs every inference to `logs/inference/inference_log.csv`
 - Tracks outcomes 30 minutes after each WARNING to `logs/inference/outcome_log.csv`
+
+**Only the pooled model is production-grade.** `06d_train_production.py`
+runs pooled models across all 5 seeds by design; asset-specific training
+was scoped to `06b`'s single-seed exploratory run
+(`v2/results_run1/{asset}/`), not the production sweep. `--asset-specific`
+exists as a flag but is currently disabled and will error with an
+explanation if used — use the pooled model (default) instead.
+
+**Fixed:** live inference previously diverged from training on four features
+due to a training/inference feature-construction mismatch: RV was missing a
+square root, intensity was 10x too large, ILLIQ used net displacement
+instead of path variation, and Kyle's lambda was computed at the trade level
+instead of training's bar-level rolling correlation (which can even flip
+sign). All four now match training's exact formulas -- see
+`build_10s_bars`, `window_features`, and inline comments in
+`apply_fracdiff_to_price` / `compute_features_from_trades` for the specifics.
 
 **Outcome classifications:**
 - `STRESS_CONFIRMED` — price dropped ≥ 0.3% and stayed down
@@ -223,10 +243,27 @@ cp /path/to/key.json gcp-key.json
 bash setup.sh                  # installs packages, detects GPU
 bash cpu_pipeline.sh           # stages 01–05b: data prep
 bash gpu_pipeline.sh           # stages 06a–06d: model training (GPU required)
-bash cpu_post_gpu.sh           # stages 07a–13b: analysis + validation + inference
+bash cpu_post_gpu.sh           # stages 07a–13c: analysis + validation + inference
 ```
 
 For detailed setup including GCP provisioning, BigQuery external tables, and RunPod configuration, see [`docs/walkthrough.md`](docs/walkthrough.md).
+
+---
+
+---
+
+## Artifacts
+
+The trained model and all result tables/labels/logs are public and don't
+require GCP credentials:
+
+- **Model**: [huggingface.co/Goooddy/maic-models](https://huggingface.co/Goooddy/maic-models)
+  — production pooled XGBoost (Fold 4, Seed 42, F1-W 0.9706) · DOI: [10.57967/hf/9684](https://doi.org/10.57967/hf/9684)
+- **Results, labels, logs**: [huggingface.co/datasets/Goooddy/maic-results](https://huggingface.co/datasets/Goooddy/maic-results)
+  — every result CSV from stages 07a-13c, global HMM labels, inference/outcome logs · DOI: [10.57967/hf/9683](https://doi.org/10.57967/hf/9683)
+
+To sync fresh artifacts after a training run: `scripts/sync_models_to_hf.py`
+and `scripts/sync_results_to_hf.py`. Both are idempotent and safe to re-run.
 
 ---
 
@@ -238,7 +275,8 @@ For detailed setup including GCP provisioning, BigQuery external tables, and Run
 | `v2/features_fracdiff/` | Fractionally differenced features (model input) |
 | `v2/labels/` | Global HMM labels (0=calm, 1=elevated, 2=stress) |
 | `v2/labels_local/fold_{n}/` | Local HMM labels per fold |
-| `v2/results_production/` | Production run outputs (5 seeds × 4 folds) |
+| `v2/results_production/` | Production run outputs, pooled only (5 seeds × 4 folds) |
+| `v2/results_run1/` | Single-seed exploratory run, incl. asset-specific models (not production-grade) |
 | `v2/results/` | Aggregated result CSVs |
 | `v2/paper_figures/` | Publication figures |
 | `v2/pipeline_markers/` | Script completion markers |
@@ -253,7 +291,7 @@ Built and validated for under £50 of cloud compute:
 |-------|----------|---------------|
 | Data prep (01–05b) | CPU | < £2 |
 | GPU training (06a–06d) | RTX PRO 4500 Blackwell 34GB | ~ £30 |
-| Analysis (07a–13b) | CPU | < £2 |
+| Analysis (07a–13c) | CPU | < £2 |
 | GCS storage | — | ~ £10/month |
 
 ---
@@ -270,6 +308,22 @@ Built and validated for under £50 of cloud compute:
   note    = {SSRN Preprint},
   doi     = {10.2139/ssrn.6761438},
   url     = {https://github.com/Goodie-Goody/maic}
+}
+
+@misc{kalu2026maicmodels,
+  title   = {MAIC: Liquidity Stress Detection Model (Pooled XGBoost)},
+  author  = {Kalu, Goodness},
+  year    = {2026},
+  doi     = {10.57967/hf/9684},
+  url     = {https://huggingface.co/Goooddy/maic-models}
+}
+
+@misc{kalu2026maicresults,
+  title   = {MAIC: Result Tables, HMM Labels, and Inference Logs},
+  author  = {Kalu, Goodness},
+  year    = {2026},
+  doi     = {10.57967/hf/9683},
+  url     = {https://huggingface.co/datasets/Goooddy/maic-results}
 }
 ```
 

@@ -1,35 +1,20 @@
 """
-12_inference.py
+12_inference.py  --  live liquidity stress detection
 
-Near Real-Time Liquidity Stress Detection — Production Inference
+Fetches the last 300s of Binance trades, computes microstructure features,
+applies fractional differencing to price, and runs XGBoost.
 
-Fetches the latest trades from Binance public REST API, computes all
-microstructure features exactly as the training pipeline does, applies
-fractional differencing to price, and runs the production XGBoost model
-to output a stress probability.
+stress_prob is the probability that current microstructure resembles a stress
+regime right now, not a countdown. Lead times of 56-108 min before documented
+crisis events arise because order flow deteriorates before price does.
+A WARNING fires when stress_prob > 0.85 for 2+ consecutive bars.
 
-WHAT THE OUTPUT MEANS:
-    stress_prob = 0.92 does NOT mean "stress in 92 minutes."
-    It means: "The current microstructure looks like a stress regime RIGHT NOW."
-
-    The lead time (108-176 min for acute crises) arises because microstructure
-    deteriorates BEFORE price moves. The model detects early signals in order
-    flow that price hasn't reflected yet.
-
-    When stress_prob > 0.85 for >= 2 consecutive bars (10 minutes),
-    a WARNING is declared. This mirrors Section III.E of the paper.
-
-USAGE:
+Usage:
     python3 scripts/12_inference.py --asset BTCUSDT
-    python3 scripts/12_inference.py --asset all
     python3 scripts/12_inference.py --asset all --loop
     python3 scripts/12_inference.py --asset BTCUSDT --json
 
-MODEL:
-    Production XGBoost (pooled, binary). Fold 4, Seed 42.
-    Weighted F1 = 0.9706 on held-out test set (Table III of paper).
-    Feature count: 28 (pooled) or 27 (asset-specific).
-    Pooled model is recommended — matches the paper's primary results.
+Model: pooled XGBoost binary, Fold 4 Seed 42, F1-W = 0.9706 (28 features).
 """
 
 import sys
@@ -37,6 +22,7 @@ import os
 import json
 import time
 import pickle
+import shutil
 import logging
 import argparse
 import warnings
@@ -81,6 +67,12 @@ BINANCE_BASE        = "https://api.binance.com"
 AGG_TRADES_ENDPOINT = "/api/v3/aggTrades"   # time-windowed aggregated trades
 KLINES_ENDPOINT     = "/api/v3/klines"
 BAR_SECONDS         = 300                   # 5-minute bar — matches training exactly
+# Training's Kyle's lambda is a rolling correlation over w consecutive 10s
+# bars (w=30 for the 300s version). A rolling window of w bar-to-bar diffs
+# needs w+1 underlying bar prices, i.e. 310s of history for the 300s case,
+# not 300s. Fetch this extra padding purely to support that -- window_features
+# still cuts off at exactly BAR_SECONDS for every other feature.
+FETCH_PADDING_S     = 10
 # N_TRADES removed: we now use a time window, not a fixed trade count
 EPSILON         = 1e-10
 
@@ -89,7 +81,7 @@ DEFAULT_SEED      = 42
 STRESS_THRESHOLD  = 0.85
 MIN_CONSECUTIVE   = 2
 
-# GCS path patterns — pooled vs asset-specific
+# GCS path patterns — pooled vs asset-specific (author's private fallback)
 MODEL_GCS_PATH_POOLED = (
     "v2/results_production/seed_{seed}/pooled/fold_{fold}/models/xgb_binary.pkl"
 )
@@ -98,11 +90,12 @@ MODEL_GCS_PATH_ASSET = (
 )
 MODELS_DIR = os.path.join(REPO_ROOT, "logs")
 
-# Base features — match COMMON_FEATURES in 06d_train_production.py exactly
-# 27 features for asset-specific models, 28 for pooled (+ asset_id)
-# Exact column order from v2/features_fracdiff/ parquets (minus "time")
-# "price" here is the fractionally differenced price — 04b overwrites it in place.
-# This must match the column order of the fracdiff parquets exactly.
+# Public Hugging Face repo holding the model pickles — this is what lets
+# anyone without GCP credentials run inference. Update to your actual repo.
+HF_REPO_ID = "Goooddy/maic-models"
+
+# Must match COMMON_FEATURES in 06d exactly. "price" is fracdiff'd in place.
+# 27 features for asset-specific, 28 for pooled (+ asset_id).
 BASE_FEATURES = [
     "price",    # fractionally differenced in place by 04b (d=0.3/0.4/0.2 per asset)
     "volume", "rv",
@@ -113,9 +106,6 @@ BASE_FEATURES = [
     "RV_300s",  "Kyle_lambda_300s",
     "VWAP_dev_10s", "VWAP_dev_60s", "VWAP_dev_300s", "CV_dt_10s",
 ]
-# 27 features for asset-specific, 28 for pooled (+ asset_id)
-
-# Pooled model adds asset_id; asset-specific models do not
 POOLED_FEATURES      = BASE_FEATURES + ["asset_id"]
 ASSET_SPECIFIC_FEATURES = BASE_FEATURES  # no asset_id
 
@@ -224,22 +214,15 @@ def log_pending_outcome(result, raw_price):
         f.write(row)
 def check_pending_outcomes():
     """
-    Check any pending outcomes whose 30-minute window has elapsed.
+    Resolve any warnings whose 30-minute outcome window has elapsed.
 
-    Uses MINIMUM price over the 30-minute window (from klines) rather than
-    price at exactly T+30min. This correctly captures stress events where
-    price dipped and recovered — a common pattern where liquidity absorbs
-    the stress without permanent price dislocation.
+    Uses the minimum price over the window rather than the price at exactly
+    T+30min -- stress events often dip and recover, and we want to capture that.
 
-    Microstructure theory note: stress regimes reflect liquidity CONDITIONS,
-    not guaranteed price direction. A TRUE_POSITIVE means the stress signal
-    preceded genuine price pressure, even if the market ultimately absorbed
-    it. FALSE_POSITIVE means price never deteriorated during the window at all.
-
-    outcome = STRESS_CONFIRMED   price dropped >= threshold at any point
-    outcome = STRESS_ABSORBED    price dropped but recovered (< threshold at end)
-    outcome = FALSE_POSITIVE     price never dropped meaningfully
-    outcome = PRICE_PUMPED       price rose significantly (opposite direction)
+    STRESS_CONFIRMED  -- price dropped >= threshold and stayed down
+    STRESS_ABSORBED   -- price dipped but recovered
+    FALSE_POSITIVE    -- price never moved meaningfully
+    PRICE_PUMPED      -- price went up instead
     """
     if not os.path.exists(OUTCOME_LOG):
         return
@@ -349,6 +332,19 @@ def check_pending_outcomes():
 # Exact implementation from 04b_stationarity_fracdiff.py
 # =============================================================================
 
+# Training pipeline (04b) uses thres=1e-5, which produces 1,458-3,382 weights
+# depending on asset d-value. Live inference only has ~80 one-minute bars of
+# price history available, making 1e-5 impossible to satisfy (the fracdiff loop
+# never executes and silently outputs NaN -> 0.0).
+#
+# thres=1e-3 produces 55-73 weights across all three assets — comfortably within
+# 80 bars while preserving the meaningful long-memory signal. The ablation study
+# (Section 4.2) confirms fracdiff contributes negligibly to XGBoost specifically,
+# so the practical impact of this threshold difference is minimal, but correctness
+# matters: the feature should carry real signal, not a hardcoded zero.
+FRACDIFF_THRES_INFERENCE = 1e-3
+
+
 def get_weights_ffd(d, thres=1e-5):
     w, k = [1.0], 1
     while True:
@@ -361,6 +357,11 @@ def get_weights_ffd(d, thres=1e-5):
 
 
 def frac_diff_single(price_series, d, thres=1e-5):
+    """
+    Apply fixed-width fractional differencing to price_series.
+    thres controls weight truncation — lower = more weights = more history needed.
+    Training uses 1e-5; inference uses FRACDIFF_THRES_INFERENCE (1e-3).
+    """
     weights = get_weights_ffd(d, thres)
     w_len   = len(weights)
     n       = len(price_series)
@@ -378,15 +379,9 @@ def frac_diff_single(price_series, d, thres=1e-5):
 
 def fetch_agg_trades_window(symbol, window_seconds=BAR_SECONDS, retries=3):
     """
-    Fetch ALL aggregated trades from Binance for the last `window_seconds`.
-    Paginates automatically if Binance returns exactly 1,000 records
-    (indicating the window was truncated). BTC regularly exceeds 1,000
-    aggTrades per 5 minutes even in quiet markets.
-
-    Uses /api/v3/aggTrades with startTime/endTime — exactly matching the
-    300-second bar construction in the training pipeline (04a).
-
-    Returns list of dicts normalised to: price, qty, isBuyerMaker, time
+    Fetch all aggTrades from the last window_seconds. Paginates automatically
+    since BTC regularly exceeds Binance's 1,000-record limit per call even in
+    quiet markets. Returns dicts with: price, qty, isBuyerMaker, time.
     """
     now_ms   = int(time.time() * 1000)
     start_ms = now_ms - (window_seconds * 1000)
@@ -474,6 +469,48 @@ def fetch_price_history(symbol, interval="1m", limit=60, retries=3):
 # Mirrors 04a_feature_engineering.py exactly
 # =============================================================================
 
+def build_10s_bars(timestamps, prices, qtys, is_buyer_side, window_end_ms, n_bars):
+    """
+    Bucket trades into n_bars contiguous 10-second bars ending at
+    window_end_ms. Forward-fills price on empty bars, zero-fills volume --
+    mirrors 04a's group_by_dynamic + upsample + forward_fill construction.
+
+    Needed specifically for Kyle's lambda: training computes it as a rolling
+    correlation over bar-level price diffs and signed volume, not trade-level
+    values -- correlation and std don't decompose across bucket boundaries
+    the way sums do, so this can't be approximated with trade-level data.
+
+    Returns (bar_prices, bar_v_buy, bar_v_sell), oldest bar first.
+    """
+    bar_prices = np.full(n_bars, np.nan)
+    bar_v_buy  = np.zeros(n_bars)
+    bar_v_sell = np.zeros(n_bars)
+
+    bar_start_ms = window_end_ms - n_bars * 10_000
+    mask = (timestamps > bar_start_ms) & (timestamps <= window_end_ms)
+    if not mask.any():
+        return bar_prices, bar_v_buy, bar_v_sell
+
+    ts_w, p_w, q_w, buy_w = timestamps[mask], prices[mask], qtys[mask], is_buyer_side[mask]
+    bar_idx = np.clip(((ts_w - bar_start_ms - 1) // 10_000).astype(int), 0, n_bars - 1)
+
+    for i in range(n_bars):
+        sel = bar_idx == i
+        if sel.any():
+            bar_prices[i] = p_w[sel][-1]
+            bar_v_buy[i]  = q_w[sel][buy_w[sel]].sum()
+            bar_v_sell[i] = q_w[sel][~buy_w[sel]].sum()
+
+    last_valid = None
+    for i in range(n_bars):
+        if np.isnan(bar_prices[i]):
+            bar_prices[i] = last_valid if last_valid is not None else p_w[0]
+        else:
+            last_valid = bar_prices[i]
+
+    return bar_prices, bar_v_buy, bar_v_sell
+
+
 def compute_features_from_trades(trades, asset):
     if not trades:
         raise ValueError("Empty trades list")
@@ -485,9 +522,6 @@ def compute_features_from_trades(trades, asset):
 
     t_end    = timestamps[-1]
     volume   = qtys.sum()
-    lr_all   = np.diff(np.log(prices + EPSILON))
-    rv_raw   = (lr_all ** 2).sum()
-
     def window_features(window_seconds):
         cutoff = t_end - window_seconds * 1000
         mask_w = timestamps >= cutoff
@@ -507,23 +541,45 @@ def compute_features_from_trades(trades, asset):
 
         vwap_w  = (p_w * q_w).sum() / (vol_w + EPSILON)
         lr_w    = np.diff(np.log(p_w + EPSILON))
-        rv_w    = (lr_w ** 2).sum() if len(lr_w) > 0 else 0.0
-        abs_ret = abs(np.log(p_w[-1] / p_w[0] + EPSILON)) if len(p_w) > 1 else 0.0
+        # RV must match training: sqrt(sum of squared log returns), not the
+        # bare sum. 04a takes sqrt at the 10s-bucket level, then squares/rolls/
+        # re-sqrts across the window -- net effect is sqrt(Sum r^2) over the
+        # full window, i.e. realized volatility, not realized variance.
+        rv_w    = np.sqrt((lr_w ** 2).sum()) if len(lr_w) > 0 else 0.0
+        # ILLIQ numerator must be the sum of every trade's |log return| in
+        # the window (path variation), not a single first-to-last displacement.
+        # A window that whipsaws and ends flat should show high ILLIQ, not zero.
+        abs_ret = np.abs(lr_w).sum() if len(lr_w) > 0 else 0.0
 
         ofi     = (v_buy_w - v_sell_w) / (v_buy_w + v_sell_w + EPSILON)
         tci     = (n_buy_w - n_sell_w) / (n_buy_w + n_sell_w + EPSILON)
-        intens  = n_w / max(window_seconds / 10, 1)
+        # Training divides trade count by window_seconds directly (w*10 bars
+        # * 10s == window_seconds). Dividing by window_seconds/10 instead
+        # made this exactly 10x too large.
+        intens  = n_w / max(window_seconds, 1)
         illiq   = abs_ret / (vol_w + EPSILON)
 
-        if len(p_w) > 2:
-            delta_p  = np.diff(p_w)
-            signed_v = q_w[1:] * (2 * buy_w[1:].astype(float) - 1)
-            kyle_lam = (
-                np.corrcoef(delta_p, signed_v)[0, 1]
-                * (delta_p.std() / (signed_v.std() + EPSILON))
-                if signed_v.std() > EPSILON else 0.0
+        # Kyle's lambda: training computes this as rolling correlation over
+        # w consecutive 10-second bars (w=6 for 60s, w=30 for 300s) of
+        # bar-level price diffs and signed volume -- not trade-level values.
+        # Correlation/std don't decompose across bucket boundaries the way
+        # sums do, so this needs genuine bar aggregation, not a trade-level
+        # approximation. w+1 bar prices are needed to get w diffs.
+        if window_seconds > 10:
+            n_bars = window_seconds // 10 + 1
+            bar_prices, bar_v_buy, bar_v_sell = build_10s_bars(
+                timestamps, prices, qtys, ~is_buyer, t_end, n_bars
             )
-            if not np.isfinite(kyle_lam):
+            dp_bar = np.diff(bar_prices)
+            sv_bar = (bar_v_buy - bar_v_sell)[1:]
+            if len(dp_bar) > 1 and dp_bar.std() > EPSILON and sv_bar.std() > EPSILON:
+                kyle_lam = (
+                    np.corrcoef(dp_bar, sv_bar)[0, 1]
+                    * (dp_bar.std() / (sv_bar.std() + EPSILON))
+                )
+                if not np.isfinite(kyle_lam):
+                    kyle_lam = 0.0
+            else:
                 kyle_lam = 0.0
         else:
             kyle_lam = 0.0
@@ -547,7 +603,10 @@ def compute_features_from_trades(trades, asset):
     return {
         "price":           cp,
         "volume":          float(volume),
-        "rv":              float(rv_raw),
+        # rv == RV_10s exactly in training (w=1 case collapses to the same
+        # sqrt(sum r^2) formula) -- reuse it rather than recompute over a
+        # mismatched trade scope.
+        "rv":              w10["rv"],
         "OFI_10s":         w10["ofi"],   "TCI_10s":        w10["tci"],
         "intensity_10s":   w10["intensity"], "VWAP_10s":   w10["vwap"],
         "ILLIQ_10s":       w10["illiq"], "RV_10s":         w10["rv"],
@@ -568,39 +627,33 @@ def compute_features_from_trades(trades, asset):
 
 def apply_fracdiff_to_price(features, asset, price_history):
     """
-    Apply fractional differencing to price IN PLACE.
-    Overwrites features["price"] with the fracdiff value — exactly
-    mirroring what 04b_stationarity_fracdiff.py does to the parquets.
-
-    Uses asset-specific d-values from config.py:
-        BTCUSDT: d=0.3
-        ETHUSDT: d=0.4
-        SOLUSDT: d=0.2
-
-    Price history (60 x 1-min close prices from klines API) provides
-    the lookback context needed for the fracdiff weights.
+    Overwrites features["price"] with the fractionally differenced value,
+    matching what 04b does to the training parquets. Uses asset-specific
+    d-values (BTC=0.3, ETH=0.4, SOL=0.2) from config.py.
     """
     d = ASSET_D_VALUES.get(asset, 0.3)
 
-    if len(price_history) < 2:
-        # Insufficient history — keep raw price, model will still run
-        # but fracdiff signal will be less accurate
+    # Use a relaxed threshold at inference time -- training had years of history,
+    # we only have ~80 bars. 1e-3 gives 55-73 weights, which fits comfortably.
+    weights_needed = len(get_weights_ffd(d, thres=FRACDIFF_THRES_INFERENCE))
+
+    if len(price_history) < weights_needed:
         logger.warning(
-            f"  [{asset}] Insufficient price history for fracdiff "
-            f"(got {len(price_history)} bars, need ~{int(1/d)+1}). "
-            f"Using raw price — first inference may be less accurate."
+            f"  [{asset}] need {weights_needed} bars for fracdiff, "
+            f"got {len(price_history)}. Using raw price."
         )
         return features
 
-    # Append current bar price to history and fracdiff the whole series
     full_series = np.append(price_history, features["price"])
-    fd_series   = frac_diff_single(full_series, d)
+    fd_series   = frac_diff_single(full_series, d, thres=FRACDIFF_THRES_INFERENCE)
+    fd_value    = fd_series[-1]
 
-    # Take the last value — the current bar's fracdiff price
-    fd_value = fd_series[-1]
+    if not np.isfinite(fd_value):
+        logger.warning(f"  [{asset}] fracdiff non-finite, using raw price.")
+        features["price"] = float(features["price"])
+    else:
+        features["price"] = float(fd_value)
 
-    # Overwrite price in place — matches 04b behaviour exactly
-    features["price"] = float(fd_value) if np.isfinite(fd_value) else 0.0
     return features
 
 # =============================================================================
@@ -608,24 +661,40 @@ def apply_fracdiff_to_price(features, asset, price_history):
 # =============================================================================
 
 def load_model(fold=DEFAULT_FOLD, seed=DEFAULT_SEED, asset=None):
+    """Load model from local cache or GCS. asset=None uses the pooled model."""
     """
-    Load production XGBoost model.
-    asset=None loads the pooled model (recommended — best performance).
-    asset="BTCUSDT" etc loads the asset-specific model.
+    Load model: local cache -> Hugging Face Hub (public) -> GCS (author only).
+    Public users hit HF and never need gcp-key.json.
     """
     tag        = asset if asset else "pooled"
-    local_path = os.path.join(MODELS_DIR, f"xgb_binary_{tag}_fold{fold}_seed{seed}.pkl")
+    filename   = f"xgb_binary_{tag}_fold{fold}_seed{seed}.pkl"
+    local_path = os.path.join(MODELS_DIR, filename)
 
     if os.path.exists(local_path):
-        logger.info(f"  Loading model from: {local_path}")
+        logger.info(f"  Loading model from local cache: {local_path}")
         with open(local_path, "rb") as f:
             return pickle.load(f)
 
+    # Try Hugging Face Hub first -- public repo, no credentials needed.
+    try:
+        from huggingface_hub import hf_hub_download
+        logger.info(f"  Downloading model from Hugging Face: {HF_REPO_ID}/{filename}")
+        hf_path = hf_hub_download(repo_id=HF_REPO_ID, filename=filename)
+        os.makedirs(MODELS_DIR, exist_ok=True)
+        shutil.copy(hf_path, local_path)
+        with open(local_path, "rb") as f:
+            return pickle.load(f)
+    except ImportError:
+        logger.warning("  huggingface_hub not installed -- trying GCS")
+    except Exception as e:
+        logger.warning(f"  Hugging Face download failed ({e}) -- trying GCS")
+
+    # Fallback: private GCS bucket. Only works with the author's own
+    # gcp-key.json -- kept for internal use, not required for public users.
     if asset:
         gcs_path = MODEL_GCS_PATH_ASSET.format(seed=seed, fold=fold, asset=asset)
     else:
         gcs_path = MODEL_GCS_PATH_POOLED.format(seed=seed, fold=fold)
-    logger.info(f"  Downloading model from GCS: gs://{BUCKET}/{gcs_path}")
 
     try:
         os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = os.path.join(
@@ -634,20 +703,19 @@ def load_model(fold=DEFAULT_FOLD, seed=DEFAULT_SEED, asset=None):
         from google.cloud import storage
         blob = storage.Client().bucket(BUCKET).blob(gcs_path)
         if not blob.exists():
-            raise FileNotFoundError(
-                f"Model not found at gs://{BUCKET}/{gcs_path}\n"
-                "Run 06d_train_production.py to generate production models."
-            )
+            raise FileNotFoundError(f"Model not found at gs://{BUCKET}/{gcs_path}")
         pkl = pickle.loads(blob.download_as_bytes())
         os.makedirs(MODELS_DIR, exist_ok=True)
         with open(local_path, "wb") as f:
             pickle.dump(pkl, f)
         logger.info(f"  Cached to {local_path}")
         return pkl
-    except ImportError:
+    except Exception as e:
         raise RuntimeError(
-            "google-cloud-storage not installed and no local model found.\n"
-            f"Place model pickle at: {local_path}"
+            f"Could not load model from local cache, Hugging Face, or GCS.\n"
+            f"Last error: {e}\n"
+            f"To fix: place the model pickle manually at {local_path}, or "
+            f"pip install huggingface_hub and check {HF_REPO_ID} is reachable."
         )
 
 # =============================================================================
@@ -660,7 +728,7 @@ def run_inference(asset, model_pkl, price_history):
     ts      = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     try:
-        trades = fetch_agg_trades_window(asset, window_seconds=BAR_SECONDS)
+        trades = fetch_agg_trades_window(asset, window_seconds=BAR_SECONDS + FETCH_PADDING_S)
         if len(trades) < 10:
             return _err(asset, ts,
                 f"Insufficient aggTrades ({len(trades)}) in last "
@@ -866,7 +934,8 @@ Examples:
     parser.add_argument("--fold",   type=int, default=DEFAULT_FOLD)
     parser.add_argument("--seed",   type=int, default=DEFAULT_SEED)
     parser.add_argument("--asset-specific", action="store_true",
-                        help="Use asset-specific model instead of pooled")
+                        help="[DISABLED] Asset-specific models were never trained "
+                             "at production (5-seed) rigor -- see note in code.")
     parser.add_argument("--quiet",  action="store_true",
                         help="Suppress INFO logs")
     args = parser.parse_args()
@@ -876,11 +945,21 @@ Examples:
 
     assets = ASSETS if args.asset == "all" else [args.asset]
 
-    # Pooled model is the default and matches Table III of the paper.
-    # Asset-specific models are available but show slightly lower performance
-    # on BTC and SOL (ETH asset-specific is the exception at F1=0.9844).
-    use_asset_specific = getattr(args, "asset_specific", False)
-    model_asset = (assets[0] if len(assets) == 1 else None) if use_asset_specific else None
+    # Pooled is the only production-grade model. 06d_train_production.py runs
+    # pooled only across all 5 seeds by design (asset-specific training was
+    # scoped to 06b's single-seed exploratory run, not the production sweep).
+    # --asset-specific is kept as a flag for visibility but currently errors:
+    # there is no 5-seed asset-specific model to load.
+    if getattr(args, "asset_specific", False):
+        logger.error(
+            "--asset-specific is disabled: production training (06d) only "
+            "produces pooled models across all 5 seeds. Single-seed "
+            "asset-specific models exist under v2/results_run1/{asset}/ from "
+            "06b's exploratory run, but aren't production-grade. Use the "
+            "pooled model (default) instead."
+        )
+        sys.exit(1)
+    model_asset = None
 
     logger.info(
         f"Loading {'asset-specific' if model_asset else 'pooled'} model "
@@ -900,7 +979,7 @@ Examples:
         for asset in assets:
             logger.info(f"Fetching live data for {asset}...")
             try:
-                price_history = fetch_price_history(asset, limit=60)
+                price_history = fetch_price_history(asset, limit=80)
             except Exception as e:
                 logger.warning(f"  [{asset}] Price history unavailable: {e}")
                 price_history = np.array([])

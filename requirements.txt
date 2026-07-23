@@ -36,3 +36,5 @@ matplotlib
 requests
 psutil
 
+huggingface_hub
+
