@@ -80,7 +80,7 @@ fi
 
 REQUIRED_KEYS=(
     GCP_PROJECT_ID GCP_BUCKET GCP_REGION BQ_DATASET BQ_TABLE
-    GOOGLE_APPLICATION_CREDENTIALS GITHUB_TOKEN GITHUB_USER GITHUB_EMAIL
+    GOOGLE_APPLICATION_CREDENTIALS GITHUB_USER GITHUB_EMAIL
 )
 
 MISSING=0
@@ -197,14 +197,10 @@ git config --global user.email "$GITHUB_EMAIL"
 git config --global user.name  "$GITHUB_USER"
 git config --global init.defaultBranch main
 git config --global pull.rebase false
-git config --global credential.helper store
 
-printf "https://%s:%s@github.com\n" "$GITHUB_USER" "$GITHUB_TOKEN" \
-    > ~/.git-credentials
-chmod 600 ~/.git-credentials
-unset GITHUB_TOKEN
-
-echo "  GitHub auth configured for $GITHUB_USER"
+# Uses SSH, not an HTTPS token -- run `ssh -T git@github.com` to confirm
+# your key is registered before this script clones/pulls anything.
+echo "  GitHub auth: using SSH key (git@github.com) for $GITHUB_USER"
 
 # =============================================================================
 # [6/8] Clone or update MAIC repo
@@ -214,7 +210,7 @@ echo "[6/8] Syncing MAIC repo..."
 
 if [ ! -d "$REPO_ROOT/.git" ]; then
     echo "  Directory is not a git repo — cloning..."
-    git clone "https://github.com/${GITHUB_USER}/maic.git" /tmp/maic_clone
+    git clone "git@github.com:${GITHUB_USER}/maic.git" /tmp/maic_clone
     cp -r /tmp/maic_clone/. "$REPO_ROOT/"
     rm -rf /tmp/maic_clone
     echo "  Repo synced"
