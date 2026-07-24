@@ -124,4 +124,4 @@ scripts/sync_models_to_hf.py
 scripts/sync_results_to_hf.py
 scripts/check_gcs_models.py
 scripts/check_rf_size.py
-.hf_sync_tmp/
+.hf_sync_tmp/verify_inference_log.sh
