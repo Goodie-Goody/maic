@@ -6,6 +6,10 @@
 ![GPU](https://img.shields.io/badge/GPU-CUDA%2012.8-green.svg)
 ![SSRN](https://img.shields.io/badge/SSRN-10.2139%2Fssrn.6761438-blue.svg)
 
+**[📄 Paper (SSRN)](https://doi.org/10.2139/ssrn.6761438)** ·
+**[🤗 Model](https://huggingface.co/Goooddy/maic-models)** ([DOI: 10.57967/hf/9684](https://doi.org/10.57967/hf/9684)) ·
+**[🤗 Data & Results](https://huggingface.co/datasets/Goooddy/maic-results)** ([DOI: 10.57967/hf/9683](https://doi.org/10.57967/hf/9683))
+
 > **Paper:** *An Early Warning System for Liquidity Stress in Cryptocurrency Markets Using Trade Flow Analysis and Machine Learning*
 > Goodness Kalu, Uchenna Ejike, Joseph Edet, Temitope E. Fagbuyi, Godfrey Kunde, and Hannah Igboke
 > WorldQuant University · Preprint: [SSRN 10.2139/ssrn.6761438](https://doi.org/10.2139/ssrn.6761438) ·
@@ -43,6 +47,7 @@ maic/
 ├── gpu_pipeline.sh                        # Stages 06a–06d (GPU required)
 ├── cpu_post_gpu.sh                        # Stages 07a–13c + inference prompt (CPU)
 ├── status.sh                              # Pipeline status dashboard
+├── test_feature_parity.py                 # Regression test: live vs offline feature parity
 ├── .env.example                           # Environment variable template
 ├── scripts/
 │   ├── 01_download.py                     # Download raw trade data from Binance
@@ -67,6 +72,7 @@ maic/
 │   ├── 13a_persistence_baseline.py        # Persistence + majority-class baselines
 │   ├── 13b_lead_time_external.py          # Lead-time against external reference defs
 │   ├── 13c_block_bootstrap_ztest.py       # Block bootstrap robustness check (Tier 1 z-tests)
+│   ├── feature_formulas.py                # Shared microstructure formulas (imported by 12_inference.py)
 │   └── 12_inference.py                    # Live stress detection from Binance API
 └── docs/
     └── walkthrough.md                     # Detailed step-by-step infrastructure guide
@@ -125,6 +131,12 @@ Purged expanding walk-forward cross-validation with 30-minute embargo. Five mode
 ---
 
 ## Key Results
+
+![SHAP feature attribution](docs/images/fig1_shap_xgb_binary.png)
+*Figure 1 from the paper (regenerate via `scripts/08_generate_paper_figures.py`,
+output at `paper_figures/production/fig1b_shap_xgb_binary.png` --
+`paper_figures/` itself stays gitignored, but this one figure is committed
+separately at `docs/images/` for the README).*
 
 **Production stability (pooled, all folds, 5 seeds):**
 
@@ -216,14 +228,49 @@ was scoped to `06b`'s single-seed exploratory run
 exists as a flag but is currently disabled and will error with an
 explanation if used — use the pooled model (default) instead.
 
-**Fixed:** live inference previously diverged from training on four features
-due to a training/inference feature-construction mismatch: RV was missing a
-square root, intensity was 10x too large, ILLIQ used net displacement
-instead of path variation, and Kyle's lambda was computed at the trade level
-instead of training's bar-level rolling correlation (which can even flip
-sign). All four now match training's exact formulas -- see
-`build_10s_bars`, `window_features`, and inline comments in
-`apply_fracdiff_to_price` / `compute_features_from_trades` for the specifics.
+**Feature parity with training.** Live inference and `04a_feature_engineering.py`
+independently implement the same seven microstructure features -- one
+vectorized in polars over months of data, one in numpy over a few hundred
+trades with a latency requirement, for genuine performance reasons neither
+can drop. That split created six real discrepancies over time, all now
+fixed and covered by a permanent regression test:
+
+- RV was missing a square root (reported variance, not volatility)
+- Intensity was divided by the wrong denominator (10x too large)
+- ILLIQ used net first-to-last displacement instead of summed path variation
+- Kyle's lambda was correlated at the trade level instead of training's
+  bar-level rolling correlation (can even flip sign)
+- The clip on extreme log returns (`[-0.5, 0.5]`, guarding against bad
+  prints) existed in training but not live
+- The top-level `volume` feature summed the entire fetched lookback window
+  instead of just the current 10-second bucket
+- Log returns were computed only on prices already sliced to the window,
+  silently dropping the first trade's return relative to whatever preceded
+  the window -- understating RV/ILLIQ by one trade's contribution every call
+
+The atomic formulas (`OFI`, `TCI`, `intensity`, `VWAP`, `ILLIQ`, `RV`,
+`Kyle's lambda`) now live in `scripts/feature_formulas.py`, imported
+directly by `12_inference.py` rather than hand-mirrored -- eliminating
+future drift for those. `04a`'s polars bucket construction remains
+separately written for throughput at month-scale; `test_feature_parity.py`
+runs both pipelines' actual functions on identical synthetic trades and
+fails loudly if they ever disagree again. Run it with `python3
+test_feature_parity.py`.
+
+**One known, quantified, deliberately unfixed residual:** training's bars
+are anchored to the absolute global 10-second clock (`group_by_dynamic`);
+live's window cutoffs are anchored to `t_end = timestamps[-1]`, i.e.
+relative to whichever trade is freshest at call time. Since real trades
+essentially never land exactly on a round grid mark, live's window edge
+drifts by a small sub-second amount from training's fixed grid on every
+call -- occasionally including or excluding one boundary trade. At the
+trade density this repo's target assets typically see, this is genuinely
+small noise, not a formula error. It could be closed by rounding `t_end`
+down to the nearest true grid mark before computing cutoffs, at the cost of
+up to just-under-10-seconds of inherent staleness in every prediction
+(inference would describe the last *completed* bar, not the freshest
+possible snapshot). Given a 300-second polling interval, that tradeoff
+wasn't judged worth it -- documented here rather than fixed.
 
 **Outcome classifications:**
 - `STRESS_CONFIRMED` — price dropped ≥ 0.3% and stayed down

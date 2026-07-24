@@ -466,8 +466,18 @@ def fetch_price_history(symbol, interval="1m", limit=60, retries=3):
 
 # =============================================================================
 # FEATURE ENGINEERING
-# Mirrors 04a_feature_engineering.py exactly
+# Mirrors 04a_feature_engineering.py exactly. Formulas live in
+# feature_formulas.py -- the single source of truth both this script and
+# test_feature_parity.py depend on, so there's nothing left to hand-mirror.
 # =============================================================================
+
+# Explicit path add rather than relying on implicit script-directory
+# behavior -- needed because validate_live_vs_offline.py loads this file
+# via importlib, which doesn't auto-add SCRIPT_DIR to sys.path the way
+# running `python3 scripts/12_inference.py` directly does.
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+import feature_formulas as ff
 
 def build_10s_bars(timestamps, prices, qtys, is_buyer_side, window_end_ms, n_bars):
     """
@@ -521,7 +531,14 @@ def compute_features_from_trades(trades, asset):
     timestamps = np.array([int(t["time"])               for t in trades])
 
     t_end    = timestamps[-1]
-    volume   = qtys.sum()
+    # Computed once, over the FULL continuous trade series -- matching
+    # training's log_ret, which is never reset at any window boundary.
+    # Slicing prices to the window BEFORE diffing (the old approach) loses
+    # the very first trade's return relative to whatever preceded the
+    # window, understating RV/ILLIQ by exactly one trade's contribution
+    # every single call.
+    full_lr = ff.clip_log_return(np.diff(np.log(prices + EPSILON))) if len(prices) > 1 else np.array([])
+
     def window_features(window_seconds):
         cutoff = t_end - window_seconds * 1000
         mask_w = timestamps >= cutoff
@@ -539,32 +556,24 @@ def compute_features_from_trades(trades, asset):
         n_w      = mask_w.sum()
         vol_w    = q_w.sum()
 
-        vwap_w  = (p_w * q_w).sum() / (vol_w + EPSILON)
-        lr_w    = np.diff(np.log(p_w + EPSILON))
-        # RV must match training: sqrt(sum of squared log returns), not the
-        # bare sum. 04a takes sqrt at the 10s-bucket level, then squares/rolls/
-        # re-sqrts across the window -- net effect is sqrt(Sum r^2) over the
-        # full window, i.e. realized volatility, not realized variance.
-        rv_w    = np.sqrt((lr_w ** 2).sum()) if len(lr_w) > 0 else 0.0
-        # ILLIQ numerator must be the sum of every trade's |log return| in
-        # the window (path variation), not a single first-to-last displacement.
-        # A window that whipsaws and ends flat should show high ILLIQ, not zero.
+        vwap_w  = ff.vwap((p_w * q_w).sum(), vol_w)
+        # full_lr[i] is the return arriving at trade i+1. Include it in this
+        # window if trade i+1 falls in the window -- regardless of whether
+        # the trade it's computed FROM (i) does. This is what preserves the
+        # boundary-crossing return training's continuous series captures.
+        lr_w = full_lr[mask_w[1:]] if len(full_lr) > 0 else np.array([])
+        rv_w    = ff.realized_volatility((lr_w ** 2).sum()) if len(lr_w) > 0 else 0.0
         abs_ret = np.abs(lr_w).sum() if len(lr_w) > 0 else 0.0
 
-        ofi     = (v_buy_w - v_sell_w) / (v_buy_w + v_sell_w + EPSILON)
-        tci     = (n_buy_w - n_sell_w) / (n_buy_w + n_sell_w + EPSILON)
-        # Training divides trade count by window_seconds directly (w*10 bars
-        # * 10s == window_seconds). Dividing by window_seconds/10 instead
-        # made this exactly 10x too large.
-        intens  = n_w / max(window_seconds, 1)
-        illiq   = abs_ret / (vol_w + EPSILON)
+        ofi_val    = ff.ofi(v_buy_w, v_sell_w)
+        tci_val    = ff.tci(n_buy_w, n_sell_w)
+        intens_val = ff.intensity(n_w, window_seconds)
+        illiq_val  = ff.illiq(abs_ret, vol_w)
 
         # Kyle's lambda: training computes this as rolling correlation over
         # w consecutive 10-second bars (w=6 for 60s, w=30 for 300s) of
         # bar-level price diffs and signed volume -- not trade-level values.
-        # Correlation/std don't decompose across bucket boundaries the way
-        # sums do, so this needs genuine bar aggregation, not a trade-level
-        # approximation. w+1 bar prices are needed to get w diffs.
+        # w+1 bar prices are needed to get w diffs.
         if window_seconds > 10:
             n_bars = window_seconds // 10 + 1
             bar_prices, bar_v_buy, bar_v_sell = build_10s_bars(
@@ -572,21 +581,13 @@ def compute_features_from_trades(trades, asset):
             )
             dp_bar = np.diff(bar_prices)
             sv_bar = (bar_v_buy - bar_v_sell)[1:]
-            if len(dp_bar) > 1 and dp_bar.std() > EPSILON and sv_bar.std() > EPSILON:
-                kyle_lam = (
-                    np.corrcoef(dp_bar, sv_bar)[0, 1]
-                    * (dp_bar.std() / (sv_bar.std() + EPSILON))
-                )
-                if not np.isfinite(kyle_lam):
-                    kyle_lam = 0.0
-            else:
-                kyle_lam = 0.0
+            kyle_lam = ff.kyle_lambda(dp_bar, sv_bar)
         else:
             kyle_lam = 0.0
 
-        return dict(ofi=float(ofi), tci=float(tci), intensity=float(intens),
-                    vwap=float(vwap_w), illiq=float(illiq), rv=float(rv_w),
-                    kyle_lam=float(kyle_lam))
+        return dict(ofi=ofi_val, tci=tci_val, intensity=intens_val,
+                    vwap=vwap_w, illiq=illiq_val, rv=rv_w,
+                    kyle_lam=kyle_lam, volume=float(vol_w))
 
     w10  = window_features(10)
     w60  = window_features(60)
@@ -602,7 +603,7 @@ def compute_features_from_trades(trades, asset):
 
     return {
         "price":           cp,
-        "volume":          float(volume),
+        "volume":          w10["volume"],
         # rv == RV_10s exactly in training (w=1 case collapses to the same
         # sqrt(sum r^2) formula) -- reuse it rather than recompute over a
         # mismatched trade scope.
@@ -618,9 +619,9 @@ def compute_features_from_trades(trades, asset):
         "intensity_300s":  w300["intensity"], "VWAP_300s": w300["vwap"],
         "ILLIQ_300s":      w300["illiq"], "RV_300s":       w300["rv"],
         "Kyle_lambda_300s": w300["kyle_lam"],
-        "VWAP_dev_10s":    (cp - w10["vwap"])  / (w10["vwap"]  + EPSILON),
-        "VWAP_dev_60s":    (cp - w60["vwap"])  / (w60["vwap"]  + EPSILON),
-        "VWAP_dev_300s":   (cp - w300["vwap"]) / (w300["vwap"] + EPSILON),
+        "VWAP_dev_10s":    ff.vwap_deviation(cp, w10["vwap"]),
+        "VWAP_dev_60s":    ff.vwap_deviation(cp, w60["vwap"]),
+        "VWAP_dev_300s":   ff.vwap_deviation(cp, w300["vwap"]),
         "CV_dt_10s":       float(cv_dt),
     }
 
